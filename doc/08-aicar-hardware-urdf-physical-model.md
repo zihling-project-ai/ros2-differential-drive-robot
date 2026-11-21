@@ -181,6 +181,6 @@ URDF + /joint_states ──> robot_state_publisher ──> TF ──> RViz2
 
 ## 9. 來源與可信度
 
-- **當事系統輸出**：2026-11-20 學校 WSL2／Pi 的 `ros2`、`gz topic`、URDF 解析輸出及實驗畫面。
+- **當事系統輸出**：2026-11-20 開發端 WSL2／Pi 的 `ros2`、`gz topic`、URDF 解析輸出及實驗畫面。
 - **教師公開上游**：[zhl017/ai_car GitHub](https://github.com/zhl017/ai_car)；其首頁目前是 ROS1 Noetic 操作手冊，而非本次 Jazzy 模型的逐行權威來源。
 - **本次已取得**：Repository ROS2 URDF；未知品牌型號、實測總重量及指定姿態質心座標仍維持「待確認」。

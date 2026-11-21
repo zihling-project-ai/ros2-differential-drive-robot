@@ -1,7 +1,7 @@
 # 07｜AICAR Gazebo 與 RViz2 模擬實驗
 
 - **日期**：2026-11-20（Asia/Taipei）
-- **平台**：學校電腦 Windows 11／WSL2 Ubuntu 24.04、ROS 2 Jazzy、Gazebo Harmonic（Gazebo Sim 8.x）、RViz2
+- **平台**：開發端 Windows 11／WSL2 Ubuntu 24.04、ROS 2 Jazzy、Gazebo Harmonic（Gazebo Sim 8.x）、RViz2
 - **對象**：AICAR 四輪底盤＋三個手臂／工具關節
 - **目的**：釐清 URDF、Gazebo 物理模擬、ROS 2 Topic／TF、RViz2 視覺化之間的責任分工
 - **執行範圍**：本機 WSL2 的模擬實驗；**未驗證實體車的馬達控制**
