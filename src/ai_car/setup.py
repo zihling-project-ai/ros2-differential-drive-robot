@@ -6,7 +6,7 @@ package_name = 'ai_car'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='0.1.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -22,7 +22,8 @@ setup(
     zip_safe=True,
     maintainer='ebyy',
     maintainer_email='ebyy@todo.todo',
-    description='TODO: Package description',
+    description='ROS 2 package for the AICAR differential-drive robot with keyboard teleoperation, '
+                'DYNAMIXEL wheel and arm control, IMU feedback, and planar odometry.',
     license='TODO: License declaration',
     entry_points={
         'console_scripts': [
