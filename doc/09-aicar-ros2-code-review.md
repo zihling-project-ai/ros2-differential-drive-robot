@@ -2,7 +2,7 @@
 
 更新日期：2026-11-21　｜　狀態：第一輪靜態審查／逐段學習中
 
-> **重要：審查基準更新。** 下方第一輪行號指向先前獨立的 278 行硬體停用安全骨架，不是本 Repository 的正式 383 行 `src/ai_car/ai_car/aicar_base.py`。不得將舊版 `hardware_enabled=False` 特性誤認為正式版本已具備的安全功能。正式程式的逐段審查即將展開，原始程式尚未修改。
+> **重要：審查基準更新。** 下方第一輪行號指向先前獨立的 278 行硬體停用安全骨架，不是本 Repository 的正式 383 行 `src/ai_car/ai_car/aicar_base.py`。不得將舊版 `hardware_enabled=False` 特性誤認為正式版本已具備的安全功能。目前手臂驅動已合併 PR #5，車輪驅動重構位於草稿 PR #6；兩者均尚未完成實車驗收。
 
 ## 0. Repository 目錄與同名程式比較
 
@@ -76,6 +76,35 @@ ros2-differential-drive-robot/    # 工程專案／ROS2 workspace
 | Zenoh | ROS2 節點間資料傳遞 | RMW、Router、QoS |
 
 實車與模擬應共用明確的 ROS2 資料契約，但是各自獨立提供資料，不應同時發布互相競爭的控制或狀態來源。相同 Topic 並不代表動力學已一致。
+
+### 底層驅動模組：Arm 與 Wheel
+
+**模組目標：** `dxl_arm.py` 與 `dxl_wheel.py` 將設備通訊、型別轉換及有效資料回報封裝成 Python 介面；兩者不是 ROS2 Node。`aicar_base.py` 管理共用連線與操作時機，驅動層不負責 Topic、里程計積分或自主決策。硬體人工診斷另外放在 `diagnostics/`，離線測試放在 `test/`。
+
+| `dxl_arm.py`（位置控制） | 介面與責任 |
+| --- | --- |
+| `angle_to_ticks(angle_deg, max_angle_deg)` | 驗證角度指令（度），轉為 Tick 增量 |
+| `validate_position_tick(tick)` | 驗證 AX 原始位置數值的編碼範圍 |
+| `__init__(port)` | 使用上層提供的 Port，設定既有速度；不自動下達復位位置命令 |
+| `_check_result(...)` | 檢查 SDK 通訊與裝置錯誤 |
+| `reset()` | 由呼叫者明確要求手臂回 Home Pose |
+| `set_torque(set_data)` | 驗證 0/1，處理 Torque 要求並檢查每個結果 |
+| `set_joint(set_data)` | 接收兩個關節角度（度），使用既有零點與方向換算位置 |
+| `set_tool(set_data)` | 接收工具角度（度），使用同樣的驗證與換算原則 |
+| `get_arm()` | 驗證並回傳三個實際關節位置（弧度） |
+
+| `dxl_wheel.py`（速度控制） | 介面與責任 |
+| --- | --- |
+| `to_int32(value)` / `to_uint32(value)` | 驗證並互轉有號數值與固定 32-bit 位元表示；不改變物理單位 |
+| `__init__(port)` | 使用共用 Port，確認既有速度控制模式、要求停止；不自動啟用 Torque |
+| `_check_result(...)` | 檢查 SDK 通訊與裝置錯誤 |
+| `_verify_velocity_mode()` | 唯讀確認馬達模式，不改寫已校正設定 |
+| `reset()` | 要求四輪停止，嘗試全部停止並回報錯誤；不重設實體 Encoder 或控制模式 |
+| `set_torque(set_data)` | 驗證並處理明確的 Torque 要求 |
+| `set_wheel(set_data)` | 接收左右側有號速度原始值；驗證後依既有對應編碼與通訊 |
+| `get_wheel()` | 驗證並回傳四輪有號 Encoder Tick，順序為左前、右前、左後、右後 |
+
+**設計決策與驗證：** 保留原有硬體 ID、零點、方向、協定及換算參數，不新增配置框架。關節的度數與弧度、車輪的有號物理值與無號封包表示分開處理。PR #5（Arm）已合併，PR #6（Wheel）仍為草稿；目前 22 項假 SDK 離線測試通過。實際機械限制、模式與停止狀態須現場確認，Base 的明確啟用、故障處理及 Encoder 基準管理尚待整合。
 
 ## 3. `aicar_base.py` 逐段閱讀路線
 
