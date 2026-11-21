@@ -1,5 +1,9 @@
 # AICAR — ROS 2 Jazzy 可重現環境、機器人規格與模擬驗證文件
 
+<img width="753" height="660" alt="image" src="https://github.com/user-attachments/assets/2ac8b5cf-3525-407a-b43e-1c973081a2ce" />
+
+專案目標：藉由差速輪車型機器人學習控制架構
+
 > 適用環境：Windows 11 / WSL2 Ubuntu 24.04 / Raspberry Pi 4（Ubuntu 24.04 ARM64） / ROS 2 Jazzy。  
 > 記錄基準：2026-11-20；連線狀態依現場網路與設備配置變動。
 
