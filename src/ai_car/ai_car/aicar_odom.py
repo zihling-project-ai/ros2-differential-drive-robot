@@ -1,164 +1,175 @@
 #!/usr/bin/env python3
-from math import sin, cos
+
+# Standard library
+from math import sin, cos, isfinite
+import time
+
+# ROS2 core and message types
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from std_msgs.msg import *
-from geometry_msgs.msg import *
+from std_msgs.msg import Empty, Float32MultiArray
+from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import Imu
 
+# Coordinate transformations
 import tf2_ros
 
-# ── 常數定義 ────────────────────────────────────────────────
-WHEEL_RADIUS     = 0.033   # 輪子半徑 (m)
-WHEEL_SEPARATION = 0.16    # 左右輪距 (m)
+# Original hardware geometry (meters)
+WHEEL_RADIUS = 0.033
+WHEEL_SEPARATION = 0.16  # Reserved for wheel-based yaw estimation.
+IMU_TIMEOUT_SEC = 0.1  # Provisional; verify on the actual transport.
+MAX_ODOM_DT_SEC = 0.2  # Reject gaps instead of integrating stale measurements.
+
 
 class AICAR_ODOM(Node):
     def __init__(self):
         super().__init__('aicar_odom')
 
-        # --- 等待 IMU 訊息 ---
+        # --- Wait for a valid IMU measurement ---
         self.get_logger().info('Waiting for /imu ...')
-        self.imu_is_reset = False
-        self.imu_ang      = 0.0
+        self.imu_stamp_ns = None
+        self.imu_received_at = None
+        self.imu_angular_velocity = 0.0
+        self.reset_stamp_ns = None
+        self.last_clock_ns = None
 
-        # --- 里程計狀態變數 ---
-        self.x     = 0.0
-        self.y     = 0.0
+        # --- Odometry state ---
+        self.x = 0.0
+        self.y = 0.0
         self.theta = 0.0
-        self.last_time = self.get_clock().now()
+        # The first valid wheel sample establishes a time baseline only.
+        self.last_time = None
 
-        # --- Subscribers ---
-        # TODO: 建立以下三個 Subscriber，綁定對應的 callback
-        #   /imu       (Imu)                → cb_imu,       queue=10
-        #   /diff_rad  (Float32MultiArray)  → cb_calc_odom, queue=10
-        #   /reset     (Empty)              → cb_reset,      queue=1
+        # --- Subscribers: preserve the three original interfaces ---
         self.create_subscription(Imu, '/imu', self.cb_imu, 10)
         self.create_subscription(Float32MultiArray, '/diff_rad', self.cb_calc_odom, 10)
         self.create_subscription(Empty, '/reset', self.cb_reset, 1)
 
-        # --- Publishers ---
-        # TODO: 建立以下一個 Publisher
-        #   /odom  (Odometry)  queue=10 
+        # --- Publisher and TF broadcaster ---
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
-
-        # --- TF Broadcaster ---
-        # TODO: 建立 tf2_ros.TransformBroadcaster 實例，指定給 self.broadcaster
         self.broadcaster = tf2_ros.TransformBroadcaster(self)
 
-        # --- Odometry 初始化 ---
+        # --- Odometry message frames ---
         self.odom = Odometry()
         self.odom.header.frame_id = 'odom'
-        self.odom.child_frame_id  = 'base_footprint'
+        self.odom.child_frame_id = 'base_footprint'
 
-    # ── Subscriber Callbacks ────────────────────────────────
-
+    # --- Subscriber callbacks ---
     def cb_reset(self, msg):
-        """
-        TODO:
-        1. 印出 '[ SET ] Odom reset'
-        2. 將 imu_is_reset 設為 False
-        3. 將 x, y, theta 歸零
-        4. 將 imu_ang 歸零
-        """
-        self.get_logger().info(f'[ SET ] Odom reset')
-        self.imu_is_reset = False
-        self.x = 0.0
-        self.y = 0.0
-        self.theta = 0.0
-        self.imu_ang = 0.0
-        self.last_time = self.get_clock().now()
+        """Reset the software pose estimate, not the physical robot or IMU."""
+        self.get_logger().info('[ SET ] Odom reset')
+        now = self._observe_clock()
+        self.reset_stamp_ns = now.nanoseconds
+        self._clear_imu()
+        self.x = self.y = self.theta = 0.0
+        self.last_time = None
 
     def cb_imu(self, msg):
-        """
-        TODO:
-        1. 從 msg.angular_velocity.z 讀取角速度，儲存到 self.imu_ang
-        2. 將 imu_is_reset 設為 True（表示 IMU 已就緒）
-        """
-        self.imu_ang = msg.angular_velocity.z
-        self.imu_is_reset = True
+        """Store only the newest valid gyro Z rate and its measurement time."""
+        now = self._observe_clock()
+        stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        age = (now.nanoseconds - stamp) / 1e9
+        if (msg.header.frame_id != 'imu_link' or not isfinite(msg.angular_velocity.z) or
+                msg.angular_velocity_covariance[0] == -1.0 or stamp <= 0 or
+                not 0.0 <= age <= IMU_TIMEOUT_SEC or
+                (self.reset_stamp_ns is not None and stamp <= self.reset_stamp_ns) or
+                (self.imu_stamp_ns is not None and stamp <= self.imu_stamp_ns)):
+            self.get_logger().warning('Ignoring invalid or out-of-order IMU sample',
+                                      throttle_duration_sec=1.0)
+            return
+        # Do not integrate across an IMU outage that ended between wheel callbacks.
+        if not self._imu_is_fresh(now):
+            self.last_time = None
+        self.imu_angular_velocity = msg.angular_velocity.z
+        self.imu_stamp_ns = stamp
+        self.imu_received_at = time.monotonic()
+
+    def _clear_imu(self):
+        self.imu_stamp_ns = None
+        self.imu_received_at = None
+        self.imu_angular_velocity = 0.0
+
+    def _observe_clock(self):
+        """Discard time baselines after a ROS clock rollback or simulation reset."""
+        now = self.get_clock().now()
+        if self.last_clock_ns is not None and now.nanoseconds < self.last_clock_ns:
+            self.last_time = None
+            self.reset_stamp_ns = None
+            self._clear_imu()
+        self.last_clock_ns = now.nanoseconds
+        return now
+
+    def _imu_is_fresh(self, now):
+        if self.imu_stamp_ns is None or self.imu_received_at is None:
+            return False
+        age = (now.nanoseconds - self.imu_stamp_ns) / 1e9
+        receive_age = time.monotonic() - self.imu_received_at
+        return (0.0 <= age <= IMU_TIMEOUT_SEC and
+                0.0 <= receive_age <= IMU_TIMEOUT_SEC)
 
     def cb_calc_odom(self, msg):
-        """
-        TODO:
-        1. 若 imu_is_reset 為 False，直接 return（IMU 尚未就緒）
-
-        2. 判斷這個時間步是否有轉動：
-           若左右輪的差分值都是 0，代表車子靜止不轉，角速度視為 0；
-           否則使用 IMU 回報的角速度
-
-        3. 取得當前時間，並計算距離上一次呼叫過了多久（dt，單位秒）；
-           若時間差不合理（小於等於 0），直接離開
-
-        4. 將左右輪的弧度差分乘上輪子半徑，換算成各自的實際行進距離
-
-        5. 取左右輪行進距離的平均，除以 dt，得到車體的線速度
-
-        6. 根據線速度、當前朝向角與 dt，計算這個時間步在 x、y 方向的位移，
-           以及朝向角的變化量，並累加到目前的位置上
-
-        7. 將更新後的位姿與速度填入 Odometry 訊息並發布：
-           位置填 x、y（z 為 0），
-           朝向用四元數表示（僅繞 Z 軸旋轉），
-           線速度與角速度也一併填入
-
-        8. 廣播 TF 座標變換（odom → base_footprint）：
-           平移部分填入目前的 x、y（z 為 0），
-           旋轉部分與 Odometry 的四元數相同
-
-        9. 將當前時間記錄為 last_time，供下次計算 dt 使用
-        """
-        if not self.imu_is_reset:
+        """Integrate valid wheel increments and gyro rate into a planar pose."""
+        now = self._observe_clock()
+        # Step 1: Require a fresh IMU sample and exactly two finite wheel increments.
+        if len(msg.data) != 2 or not all(isfinite(value) for value in msg.data):
+            self.last_time = None
+            self.get_logger().warning('Invalid wheel increments', throttle_duration_sec=1.0)
+            return
+        if not self._imu_is_fresh(now):
+            self.last_time = None
+            self.get_logger().warning('IMU unavailable or stale; odometry paused',
+                                      throttle_duration_sec=1.0)
             return
 
-        
-        # Step 2：角速度
-        if msg.data[0] == msg.data[1] == 0:
-            ang_vel = 0.0
-        else:
-            ang_vel = self.imu_ang
+        # Step 2: Retain the teacher's stationary-wheel bias suppression heuristic.
+        # It is not proof of body stationarity (slip or external motion is possible).
+        ang_vel = 0.0 if msg.data[0] == msg.data[1] == 0 else self.imu_angular_velocity
 
-        # Step 3：時間差
-        now = self.get_clock().now()
+        # Step 3: Establish a baseline and reject invalid or excessive time gaps.
+        # /diff_rad has no header, so this uses reception time, not acquisition time.
+        if self.last_time is None:
+            self.last_time = now
+            return
         dt = (now - self.last_time).nanoseconds / 1e9
-
-        if dt <= 0:
+        if not 0.0 < dt <= MAX_ODOM_DT_SEC:
+            self.last_time = now if dt > 0 else None
+            self.get_logger().warning('Invalid odometry interval; rebaselining',
+                                      throttle_duration_sec=1.0)
             return
 
-        # Step 4：左右輪行進距離
+        # Step 4: Convert wheel angles to traveled distances (meters).
         left_dist = WHEEL_RADIUS * msg.data[0]
         right_dist = WHEEL_RADIUS * msg.data[1]
 
-        # Step 5：車體線速度
-        lin_vel = ((left_dist + right_dist) / 2) / dt
-        
+        # Step 5: The mean wheel distance approximates the body-center distance.
+        distance = (left_dist + right_dist) / 2.0
+        lin_vel = distance / dt
 
-        # Step 6：累加位移到目前的位置上
-        self.x     += lin_vel * cos(self.theta) *dt
-        self.y     += lin_vel * sin(self.theta) *dt
-        self.theta += ang_vel * dt
+        # Step 6: Use the midpoint heading to approximate motion along a curve.
+        delta_theta = ang_vel * dt
+        theta_mid = self.theta + delta_theta / 2.0
+        self.x += distance * cos(theta_mid)
+        self.y += distance * sin(theta_mid)
+        self.theta += delta_theta
 
-        # Step 7：將更新後的位置與速度填入 Odometry 訊息
+        # Step 7: Fill the estimated pose in odom and twist in base_footprint.
         self.odom.pose.pose.position.x = self.x
         self.odom.pose.pose.position.y = self.y
         self.odom.pose.pose.position.z = 0.0
-
         self.odom.pose.pose.orientation.x = 0.0
         self.odom.pose.pose.orientation.y = 0.0
         self.odom.pose.pose.orientation.z = sin(self.theta / 2)
         self.odom.pose.pose.orientation.w = cos(self.theta / 2)
-        
-        # 線速度與角速度
+
+        # Planar velocity in the robot's own frame. Covariances are uncalibrated.
         self.odom.twist.twist.linear.x = lin_vel
         self.odom.twist.twist.angular.z = ang_vel
-
-        # 時間戳記
+        # Use the same estimate timestamp for odometry and TF.
         self.odom.header.stamp = now.to_msg()
-
-        # 發布 Odometry
         self.odom_pub.publish(self.odom)
 
-        # Step 8： 廣播 TF 座標變換（odom → base_footprint）
+        # Step 8: Broadcast TF (odom -> base_footprint) from the same estimate.
         tf_msg = TransformStamped()
         tf_msg.header.stamp = self.odom.header.stamp
         tf_msg.header.frame_id = self.odom.header.frame_id
@@ -172,20 +183,26 @@ class AICAR_ODOM(Node):
         tf_msg.transform.rotation.w = self.odom.pose.pose.orientation.w
         self.broadcaster.sendTransform(tf_msg)
 
-        # 9. 將當前時間記錄為 last_time，供下次計算 dt 使用
+        # Step 9: Retain the timestamp for the next integration interval.
         self.last_time = now
 
-def main():
-    rclpy.init()
-    node = AICAR_ODOM()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = None
     try:
+        node = AICAR_ODOM()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        # No direct hardware resources; still shut down ROS if creation fails.
+        try:
+            if node is not None:
+                node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == '__main__':

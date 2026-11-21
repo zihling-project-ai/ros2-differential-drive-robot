@@ -198,7 +198,38 @@ MPU9250 (I²C, bus 1, address 0x68)
 | 中 | 未確認資料方向、偏差、頻率、時間戳與 covariance | 離線驗證訊息契約；實車靜止及已知角度驗收，之後設定可信參數 |
 | 低 | 轉換常數及外部依賴未明確說明 | `math.radians()`、英文註解；部署時確認 `smbus` 依賴 |
 
-**狀態（草稿 PR #6）：** 已重構正式 IMU Node，保留 `share/` 參考原版及原始硬體參數。新增 `python3-smbus` 執行依賴；10 項 IMU 假硬體測試與既有 36 項測試全部通過（共 46 項）。ROS2 容器 IMU smoke test 已加入 CI，待本次執行結果。尚未實測裝置 ID、I²C 連續讀取、量測頻率、校正及座標；若校方板卡不是預期 MPU9250，應先辨識型號而非直接跳過 ID 檢查。先維持單一 Node，不引入 EKF 或新的驅動架構；IMU 讀取失敗時停止發布，但 Odometry 目前仍可能使用最後一次角速度，須在下階段修正資料過期處理。
+**狀態（草稿 PR #6）：** 已重構正式 IMU Node，保留 `share/` 參考原版及原始硬體參數。新增 `python3-smbus` 執行依賴；10 項 IMU 假硬體測試與既有 36 項測試全部通過（共 46 項）；ROS2 容器 IMU smoke test 已加入 CI。尚未實測裝置 ID、I²C 連續讀取、量測頻率、校正及座標；若校方板卡不是預期 MPU9250，應先辨識型號而非直接跳過 ID 檢查。先維持單一 Node，不引入 EKF 或新的驅動架構；IMU 讀取失敗時停止發布，下游 Odometry 已新增資料過期檢查。
+
+### `aicar_odom.py`：運動學、數值積分與 TF
+
+**模組目標：** 不直接操作硬體；使用 `/diff_rad`（左、右前輪本次角度增量）及 `/imu`（Z 軸角速度）持續估算二維位姿 `(x, y, theta)` 和速度，發布 `/odom` 並廣播同一次估算的 `odom → base_footprint`。由車輪訊息觸發運算，目標更新率取決於 Base（30 Hz），不是 IMU（200 Hz）。
+
+| 函式 | 責任與設計理由 |
+| --- | --- |
+| `__init__()` | 建立狀態、時間基準、訂閱、發布與 TF；第一筆有效輸入只建立基準 |
+| `cb_reset()` | 清除軟體位姿、舊 IMU 與積分時間；不移動車體、不校正感測器 |
+| `cb_imu()` | 檢查座標、有效數值及時間戳，僅接收最新有效角速度 |
+| `_observe_clock()`、`_imu_is_fresh()` | 處理 ROS 時間倒退、量測時間與接收時間過期 |
+| `cb_calc_odom()` | 驗證資料與時間間隔；換算行進距離，進行 Midpoint 積分及發布 |
+| `main()` | 建立、spin、銷毀 Node，確保初始化失敗也關閉 ROS2 |
+
+**差速正向運動學：** 車輪半徑 `r = 0.033 m`、輪距 `L = 0.16 m` 保留不變；與 Base 的逆向運動學互為對應。輪角度增量 `Δφ_L`、`Δφ_R`（rad）換算成行進距離 `s_L = r Δφ_L`、`s_R = r Δφ_R`（m）。車體中心位移 `s = (s_L+s_R)/2`，線速度 `v = s/Δt`。若以 Encoder 計算角度，理想差速模型為 `Δθ = (s_R − s_L)/L`；此版本仍使用 IMU 的 `Δθ = ω_z Δt`，不另外引入融合演算法。模型假設有效輪徑正確且輪子不打滑；四輪實際轉向與滑動需驗證。
+
+**二維位置積分：** 朝向 `θ` 為弧度，`cos(θ)`、`sin(θ)` 將車體前進方向投影到 odom 的 X/Y 軸；原版 Euler 使用區間開始的朝向，新版 Midpoint 使用 `θ_mid = θ + Δθ/2`，`x += s cos(θ_mid)`、`y += s sin(θ_mid)`、`θ += Δθ`。Midpoint 減少曲線近似誤差，仍非精確圓弧；不能修正 IMU Bias、打滑或時間誤差。左右輪位移皆零時保留教師的靜止漂移抑制假設，需留意外力旋轉或打滑；不等同證明車體完全靜止。
+
+**Quaternion：** Odometry 內部保留單一 Yaw；輸出標準 ROS2 Quaternion `(0, 0, sin(θ/2), cos(θ/2))`，滿足單位長度。90° 對應 `(0,0,0.7071,0.7071)`；`q` 與 `−q` 表示同一旋轉。三維 Euler 角在特定姿態可能出現萬向鎖（兩個旋轉自由度的參數方向重合，無法獨立區分），Quaternion 不具有該 Euler 表示奇異點。AICAR 平面 Yaw 不會遭遇此三維問題，使用 Quaternion 是為了遵循 ROS2 訊息契約。
+
+| 介面 | 責任 | 座標或資料 |
+| --- | --- | --- |
+| `/odom` | 對外提供狀態估算 | Pose 在 `odom`；Twist 在 `base_footprint`；含 covariance 欄位 |
+| `/tf` | 供 tf2 查詢座標與時間關係 | 同一估算的 `odom → base_footprint`，沒有速度或 covariance |
+| `/tf_static` | URDF 固定關節座標關係 | `base_footprint → base_link → imu_link` 等；Robot State Publisher |
+
+`/odom` 與 `/tf` 使用相同位姿與時間戳，前者供導航讀取狀態，後者供 RViz2、LiDAR、SLAM 將不同來源的資料轉換至共同座標系。`map → odom` 由定位或 SLAM 提供；不得由 Odometry 重複廣播定位變換。同一 TF 邊應有單一發布責任。`odom` 正常運作應連續，長期漂移由定位修正，而非週期性 Reset。
+
+**時間與 Reset 的設計取捨：** IMU 同時檢查 ROS header 時間及單調接收時間（暫定 0.1 s）；輪回饋間隔上限暫定 0.2 s，異常時不發布新的估算，恢復時重建基準而非補積分中斷時間。無效或缺失區間的位移不能被還原，暫停估算也不是停止實車。共享 `/reset` 無跨 Node 同步確認；丟棄 Reset 前 IMU 時戳，仍無法分辨未帶 header 的舊 `/diff_rad`，只能在停止且隔離的測試流程驗證。今後用具量測時戳、序列或累計值的車輪介面才能完整驗證遺失、延遲及基準切換；跨主機需同步時鐘。Covariance 目前未校正，預設零不代表已知零誤差，不能直接當成可信融合量測。
+
+**驗收狀態（草稿 PR #6）：** 保留原有 Topic、幾何參數、Quaternion 與 TF 邏輯。新增 12 項合成資料離線測試（共 58 項通過），包括直行、倒退、原地旋轉、Midpoint、資料過期、回時、Reset、Quaternion/TF 一致性及初始化清理；ROS2 Odometry/TF smoke test 已加入 CI。實車頻率、時間閾值、漂移、輪徑／輪距、covariance 及導航整合尚待驗收；不因通過測試而宣稱完成定位或安全驗證。
 
 ## 4. 第一輪程式碼審查（歷史：278 行安全骨架）
 
@@ -242,7 +273,7 @@ MPU9250 (I²C, bus 1, address 0x68)
 | 主題 | 應檢查的介面與證據 |
 | --- | --- |
 | DYNAMIXEL | 型號、協定、ID、量測單位、裝置錯誤處理、安全限制、故障與停用驗收 |
-| Odometry | 輪徑與輪距、四輪模型、符號、時間差、Pose/Twist、covariance、重設語義 |
+| Odometry | 重構及離線測試完成；待 ROS2 CI、實車輪徑輪距、符號、時間、四輪模型、covariance 與重設驗證 |
 | IMU | 重構及離線測試完成；待 ROS2 CI 與座標、校準、頻率與 covariance 的實車驗證 |
 | TF | `map → odom → base_link` 的發布者責任；URDF link/joint 名稱一致；每條 TF 不應重複發布 |
 | ROS2 配置 | `package.xml`、依賴、Launch、參數預設、模擬／實車隔離、QoS |
@@ -277,6 +308,8 @@ RViz2 的 `Fixed Frame` 必須存在於 TF Tree。模型顯示階段可先使用
 - [ROS2 Jazzy rmw_zenoh](https://github.com/ros2/rmw_zenoh/tree/jazzy)
 - [ROS2 Jazzy sensor_msgs/Imu 訊息定義](https://github.com/ros2/common_interfaces/blob/jazzy/sensor_msgs/msg/Imu.msg)
 - [REP-103：單位與座標規範](https://github.com/ros-infrastructure/rep/blob/master/rep-0103.rst)
+- [REP-105：移動機器人座標規範](https://github.com/ros-infrastructure/rep/blob/master/rep-0105.rst)
+- [ROS2 Jazzy nav_msgs/Odometry](https://github.com/ros2/common_interfaces/blob/jazzy/nav_msgs/msg/Odometry.msg)
 - [TDK MPU9250 Register Map](https://invensense.tdk.com/wp-content/uploads/2015/02/MPU-9250-Register-Map.pdf)
 - [Analog Devices：Gyroscope Calibration](https://www.analog.com/media/en/technical-documentation/technical-articles/gyrocalibration_edn_eu_7_2010.pdf)
 - [Gazebo 與 ROS 相容版本](https://gazebosim.org/docs/harmonic/ros_installation/)
