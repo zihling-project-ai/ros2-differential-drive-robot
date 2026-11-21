@@ -1,8 +1,8 @@
-# 09｜AICAR ROS2 程式碼模組教學與審查
+# 09｜AICAR ROS2 軟體工程設計與審查
 
-更新日期：2026-11-21　｜　狀態：第一輪靜態審查／逐段學習中
+更新日期：2026-11-21　｜　狀態：六個核心模組離線驗收完成，實車待驗證
 
-> **重要：審查基準更新。** 下方第一輪行號指向先前獨立的 278 行硬體停用安全骨架，不是本 Repository 的原始正式 `src/ai_car/ai_car/aicar_base.py`。不得將舊版 `hardware_enabled=False` 特性誤認為正式版本已具備的安全功能。目前手臂驅動已合併 PR #5，車輪驅動與 Base Node 重構位於草稿 PR #6；均尚未完成實車驗收。
+> **審查基準：** ROS2 套件 v0.1.0，PR #5、#6、#7 已合併至 main。保留原教師 TODO 步驟及英文設計註解。79 項離線測試與四個 ROS2 smoke test（假硬體／合成資料）通過；尚未完成實車驗收。測試證據見 [06](06-smoke-tests.md)。
 
 ## 0. Repository 目錄與同名程式比較
 
@@ -17,6 +17,8 @@ ros2-differential-drive-robot/    # 工程專案／ROS2 workspace
 ├── src/
 │   └── ai_car/                  # ROS2 package
 │       ├── ai_car/              # 正式 Python 模組：控制、驅動、感知、里程計
+│       ├── diagnostics/         # 手動硬體診斷，不屬於離線 CI
+│       ├── test/                # 離線單元測試與 ROS2 smoke test
 │       ├── config/              # SLAM / Nav2 參數
 │       ├── launch/              # ROS2 nodes 的啟動與協調
 │       ├── urdf/                # 機器人結構、關節與物理模型
@@ -37,15 +39,13 @@ ros2-differential-drive-robot/    # 工程專案／ROS2 workspace
 
 `src/ai_car/setup.py` 的 `console_scripts` 指向 `ai_car.aicar_base`、`aicar_imu`、`aicar_odom`、`aicar_teleop`；`find_packages()` 安裝 Python package。`data_files` 中的 `share/ai_car` 是安裝後資源目錄，不是來源中的 `src/ai_car/share/`。目前追蹤檔內未發現使用來源 `share/` 的引用。
 
-| 同名 Python 檔 | `share/` / `ai_car/` 行數 | 比較 |
-| --- | ---: | --- |
-| `aicar_base.py` | 238 / 383 | 非同版；參考版有 `calc_diff()`，正式版展開回呼及 Encoder 程式 |
-| `aicar_imu.py` | 88 / 88 | 位元組完全一致 |
-| `aicar_odom.py` | 139 / 192 | 非同版；依賴匯入、回呼與實作不同 |
-| `aicar_teleop.py` | 198 / 309 | 非同版；正式版鍵盤與手臂發布流程不同 |
-| `ball_detector.py` | 156 / 128 | 非同版；影像回呼和偵測流程有差異 |
-| `lidar_follow.py` | 88 / 29 | 正式版多處 `pass`；參考版有 `/scan` 訂閱與較完整內容 |
-| `lidar_sub.py` | 97 / 87 | 正式版保留 TODO/pass，兩者不能視為等價 |
+| 同名 Python 檔 | 現行正式版與教師參考版的關係 |
+| --- | --- |
+| `aicar_base.py` | 正式版已重構命令、回饋、Reset、逾時與清理 |
+| `aicar_imu.py` | 正式版新增裝置識別、連續讀取及異常處理 |
+| `aicar_odom.py` | 正式版改用累計輪角與時間戳、Midpoint 積分 |
+| `aicar_teleop.py` | 正式版增加回饋同步與命令期限 |
+| `ball_detector.py`、`lidar_follow.py`、`lidar_sub.py` | 仍有實作差異，未納入六個核心模組驗收 |
 
 結論：來源 `share/` 目前並非正常 ROS2 套件執行入口；可以考慮在確認有用差異後移除，但目前保留，不直接將參考版本覆蓋正式程式。尤其 LiDAR 模組需先逐段比較與測試。`me333_pkg` 已移除，原始教材可由 Git 歷史找回。
 
@@ -55,12 +55,11 @@ ros2-differential-drive-robot/    # 工程專案／ROS2 workspace
 
 | 來源 | 狀態 |
 | --- | --- |
-| 早期 `aicar_base.py` 安全骨架（278 行） | 歷史靜態審查基準；不是目前正式程式 |
-| 本 Repository `ai_car/ai_car/aicar_base.py` | 已逐段審查並於 PR #6 重構；離線單元測試通過，待實車驗收 |
+| 六個核心模組與 `constants.py` | 已審查、重構、整合；離線測試通過，待實車驗收 |
 | 老師公開的 [ai_car 倉庫](https://github.com/zhl017/ai_car) | 公開首頁顯示 ROS1 Noetic；不能當作目前 ROS2 原始碼 |
-| DYNAMIXEL 驅動、Odometry/IMU、URDF、Launch、YAML | 已取得本 Repository 原始碼；驅動已重構，其餘模組尚待逐段審查 |
+| LiDAR、Ball Detector、Launch、Nav2、SLAM、Gazebo、RViz2 | 保留原有程式與資源；非本次重構及端到端驗收範圍 |
 
-P0/P1/P2 表示修復或驗收優先級，而非事故發生機率。第 4 節保留先前安全骨架的歷史審查結果；目前實作以 PR #6 為準。
+P0/P1/P2 表示修復或驗收優先級，而非事故發生機率。第 4 節記錄現行版本的待驗證條件。
 
 ## 2. ROS2 模組地圖
 
@@ -68,7 +67,7 @@ P0/P1/P2 表示修復或驗收優先級，而非事故發生機率。第 4 節�
 | --- | --- | --- |
 | Teleop / Planner | 產生運動需求 | `cmd_vel` (`Twist`) |
 | Base Control | 解讀需求、協調底層驅動與狀態 | `cmd_vel`、`joint_states` |
-| DYNAMIXEL Driver | 硬體專屬通訊與回饋驗證 | Controller API（待確認） |
+| DYNAMIXEL Driver | 硬體專屬通訊與回饋驗證 | Arm/Wheel Controller API |
 | Odometry / IMU | 量測旋轉速度、估算位姿 | `/odom`、`/imu`（本專案） |
 | State Estimation | 感測器融合 | Pose、TF |
 | URDF / State Publisher | 車體與關節座標關係 | `robot_description`、`tf`、`tf_static` |
@@ -97,7 +96,7 @@ P0/P1/P2 表示修復或驗收優先級，而非事故發生機率。第 4 節�
 
 `cb` 為 Callback（回呼函式）。Subscriber 的 `cb_reset()`、`cb_torque()`、`cb_wheel_torque()`、`cb_tool()`、`cb_joint()`、`cb_cmd()` 接收並驗證、暫存命令；`cb_timer()` 負責定期執行硬體操作及發布回饋。目前目標頻率為 30 Hz。絕對目標採用最新有效指令（Latest-wins），停止與停用要求優先；已過期的速度目標不能繼續使用。
 
-草稿 PR #6 的控制順序（尚待實車驗收）：
+現行控制順序（尚待實車驗收）：
 
 ```text
 Timer 觸發
@@ -139,7 +138,9 @@ Timer 觸發
 | `set_wheel(set_data)` | 接收左右側有號速度原始值；驗證後依既有對應編碼與通訊 |
 | `get_wheel()` | 驗證並回傳四輪有號 Encoder Tick，順序為左前、右前、左後、右後 |
 
-**設計決策與驗證：** 保留原有硬體 ID、零點、方向、協定及換算參數，不新增配置框架。關節的度數與弧度、車輪的有號物理值與無號封包表示分開處理。PR #5（Arm）已合併，PR #6（Wheel／Base）仍為草稿；目前 36 項離線單元測試通過。實際機械限制、模式、Encoder 連續性及停止狀態仍須現場確認；Base 介面整合不等同於實車安全驗收。
+**設計決策與驗證：** 保留原有硬體 ID、零點、方向、協定及換算參數，不新增配置框架。關節的度數與弧度、車輪的有號物理值與無號封包表示分開處理。Arm 與 Wheel 分別有 9、13 項離線測試通過。實際機械限制、模式、Encoder 連續性及停止狀態仍須現場確認；Base 介面整合不等同於實車安全驗收。
+
+**數值編碼與物理換算：** Tick 是裝置量測的離散數值，二補數是固定長度位元的有號表示，兩者與角度、角速度的物理單位各自獨立。32-bit 有號值的最高位權重是 −2³¹，其餘位權重為正；例如 `0xFFFFFFFF` 解讀為 −1，而非 4294967295 Tick。換算角度時仍需依馬達解析度、方向、零點偏移決定。Base 保留低速增量及回繞處理，不能以重新設定馬達位置代替 Odometry 歸零。
 
 ## 3. `aicar_base.py` 重構介面與設計判斷（PR #6）
 
@@ -153,7 +154,7 @@ Timer 觸發
 | `fn_update_states()` | 建立 Encoder 基準、保留低速增量並驗證所有回饋；發布帶時間戳的累計角度，保留前兩輪 `/diff_rad` 教學介面 |
 | `fn_shutdown()`、`main()` | 停止請求與資源清理分開，不依賴等待時間或自動手臂移動證明安全 |
 
-英文註解保留原教學步驟並補上設計原因。36 項假硬體離線測試已通過；ROS2 容器驗收與實車測試仍需分別追蹤。
+英文註解保留原教學步驟並補上設計原因。14 項 Base 離線測試與 ROS2 Base smoke test 已通過；實車待驗證。Base 提供目標、回饋與通訊協調，並未實作馬達內部 PID；智慧伺服裝置內部閉環和 ROS2 上層控制週期是不同層次。
 
 ### `aicar_imu.py`（MPU9250）：量測介面與定位估算分離
 
@@ -198,7 +199,7 @@ MPU9250 (I²C, bus 1, address 0x68)
 | 中 | 未確認資料方向、偏差、頻率、時間戳與 covariance | 離線驗證訊息契約；實車靜止及已知角度驗收，之後設定可信參數 |
 | 低 | 轉換常數及外部依賴未明確說明 | `math.radians()`、英文註解；部署時確認 `smbus` 依賴 |
 
-**狀態（草稿 PR #6）：** 已重構正式 IMU Node，保留 `share/` 參考原版及原始硬體參數。新增 `python3-smbus` 執行依賴；10 項 IMU 假硬體測試與既有 36 項測試全部通過（共 46 項）；ROS2 容器 IMU smoke test 已加入 CI。尚未實測裝置 ID、I²C 連續讀取、量測頻率、校正及座標；若校方板卡不是預期 MPU9250，應先辨識型號而非直接跳過 ID 檢查。先維持單一 Node，不引入 EKF 或新的驅動架構；IMU 讀取失敗時停止發布，下游 Odometry 已新增資料過期檢查。
+**驗收狀態：** 已重構正式 IMU Node，保留 `share/` 參考原版及原始硬體參數。新增 `python3-smbus` 執行依賴；10 項 IMU 假硬體測試與 ROS2 IMU smoke test 通過。尚未實測裝置 ID、I²C 連續讀取、量測頻率、校正及座標；若板卡不是預期 MPU9250，應先辨識型號而非直接跳過 ID 檢查。先維持單一 Node，不引入 EKF 或新的驅動架構；IMU 讀取失敗時停止發布，下游 Odometry 已新增資料過期檢查。
 
 ### `aicar_odom.py`：運動學、數值積分與 TF
 
@@ -229,7 +230,7 @@ MPU9250 (I²C, bus 1, address 0x68)
 
 **時間與 Reset 的設計取捨：** IMU 同時檢查 ROS header 時間及單調接收時間（暫定 0.1 s），且與輪回饋時間差須在同一門檻內；輪回饋新鮮度及輪回饋間隔上限皆暫定 0.2 s。使用 `JointState.header.stamp` 的時間差而非接收時間，`/odom`、TF 共用該時間戳；前後累計角度之差可在短暫遺失訊息且資料仍有效時保留輪距離增量。超過時間上限、無效或 IMU 中斷的區間不補積分，恢復時重建基準。Base 的時間戳為該批硬體讀取完成後的主機時間，不是四個 Encoder 獨立的硬體時間；最新 IMU 角速度仍是區間近似，跨主機需同步時鐘。暫停估算不是停止實車。共享 `/reset` 不具跨 Node 原子同步；Base 停輪並重建 raw tick 基準，但保留累計角度，Odometry 清除位姿及差分基準、拒絕 Reset 前的 IMU 與 JointState 時戳，避免兩個 Node 處理順序不同造成假的反向位移。仍應在已停止的測試流程執行 Reset；Base 程序重新啟動會重新建立累計值，須協調重新啟動 Odometry 或重新歸零，不能假設所有中斷均可自動識別。`/joint_states` 必須只有可信的實車回饋來源，不得混入展示 GUI。Covariance 目前未校正，預設零不代表已知零誤差，不能直接當成可信融合量測。
 
-**驗收狀態（草稿 PR #6）：** 保留 `/diff_rad`、原始幾何參數、Quaternion 與 TF 邏輯；Odometry 改用 `/joint_states`。原有 12 項測試改為累計角度資料，新增 7 項測試：量測時間與接收時間差、短期遺失、重複及亂序、依名索引、兩種 Reset 處理順序、過期／未對齊資料；Base 原有 Reset 測試同時驗證累計角度連續與 `/diff_rad` 歸零。共 79 項離線測試通過，ROS2 Odometry/TF smoke test 隨介面更新。實車頻率、時間閾值、漂移、輪徑／輪距、covariance 及導航整合尚待驗收；不因通過測試而宣稱完成定位或安全驗證。
+**驗收狀態：** 保留 `/diff_rad`、原始幾何參數、Quaternion 與 TF 邏輯；Odometry 改用 `/joint_states`。19 項離線測試涵蓋累計角度、量測時間與接收時間差、短期遺失、重複及亂序、依名索引、兩種 Reset 處理順序、過期／未對齊資料；Base Reset 測試同時驗證累計角度連續與 `/diff_rad` 歸零。ROS2 Odometry/TF smoke test 通過。實車頻率、時間閾值、漂移、輪徑／輪距、covariance 及導航整合尚待驗收；不因通過測試而宣稱完成定位或安全驗證。
 
 ### `aicar_teleop.py`：操作目標、回饋及命令有效性
 
@@ -247,84 +248,40 @@ MPU9250 (I²C, bus 1, address 0x68)
 
 **設計判斷：** 保留原始最大速度與角度範圍（尚未驗證為實車安全限制）；將正式版步進從 1 m/s、2 rad/s 恢復教師的 0.01 m/s、0.5 rad/s；手臂 2° 不變。暫定鍵盤目標期限 0.3 s、輪詢 0.1 s、手臂回饋期限 0.5 s；Base 的 0.5 s 逾時是獨立第二層保護。只有有效車輪按鍵更新期限，停止操作後不再重發非零目標。終端機不能可靠偵測按鍵放開或所有延遲按鍵；這不是硬體 dead-man switch，亦非安全認證急停。`/torque`、`/wheel_torque` 仍須明確啟用；收到其要求不是馬達狀態確認，Topic 也無跨 Node 原子同步。手臂位置命令未必即時達位；無效回饋、掉線或過期時不得創造新的角度目標。`h` 是使用者明確要求的 Home，`s` 是要求停止車輪，不會自動關閉手臂支撐扭矩。
 
-**驗收狀態（草稿 PR #6）：** 11 項 Teleop 離線測試通過，合計 69 項；包含步進與限制、命令期限、Reset、依名讀取回饋、分離 Joint/Tool、Home、Torque 要求造成的目標失效、EOF 清理等；真實 ROS2 訊息 smoke test 已加入 CI。尚須實車確認鍵盤連續輸入時的行為、回饋與命令延遲、停止與獨立硬體保護；鍵盤與導航等不同控制來源不得同時競爭 `/cmd_vel`。LiDAR、Ball Detector 留待後續階段。
+**驗收狀態：** 11 項 Teleop 離線測試通過；包含步進與限制、命令期限、Reset、依名讀取回饋、分離 Joint/Tool、Home、Torque 要求造成的目標失效、EOF 清理等；ROS2 訊息 smoke test 通過。尚須實車確認鍵盤連續輸入時的行為、回饋與命令延遲、停止與獨立硬體保護；鍵盤與導航等不同控制來源不得同時競爭 `/cmd_vel`。LiDAR、Ball Detector 留待後續階段。
 
 ### 共用機器人參數：`constants.py`
 
-將描述同一機器人規格或 ROS 介面的常數放在不依賴 ROS2、硬體 SDK 的純 Python 模組：車輪半徑 0.033 m、輪距 0.16 m、關節命令範圍 0～90°、工具命令範圍 0～45°、明確 Home Pose `(0, 0, 0)`、手臂關節名稱與 `imu_link`。Base 與 Odometry 必須使用同一幾何模型；Arm、Base 與 Teleop 必須使用一致的命令範圍；IMU 發布的 Frame 必須與 Odometry 驗證相容。硬體 ID、暫存器、零點校正、裝置通訊、操作步進、各層逾時等仍留在各自模組。這不是 YAML 或執行期配置框架；所有數值維持原樣，並非實測機械限制。新增 3 項純常數／URDF 名稱一致性測試，合計 72 項離線測試；實車校正仍待驗收。
+將描述同一機器人規格或 ROS 介面的常數放在不依賴 ROS2、硬體 SDK 的純 Python 模組：車輪半徑 0.033 m、輪距 0.16 m、關節命令範圍 0～90°、工具命令範圍 0～45°、明確 Home Pose `(0, 0, 0)`、手臂關節名稱與 `imu_link`。Base 與 Odometry 必須使用同一幾何模型；Arm、Base 與 Teleop 必須使用一致的命令範圍；IMU 發布的 Frame 必須與 Odometry 驗證相容。硬體 ID、暫存器、零點校正、裝置通訊、操作步進、各層逾時等仍留在各自模組。這不是 YAML 或執行期配置框架；所有數值維持原樣，並非實測機械限制。3 項純常數／URDF 名稱一致性測試通過；實車校正仍待驗收。工具關節 URDF 與命令範圍差異見 [08](08-aicar-hardware-urdf-physical-model.md)。
 
-## 4. 第一輪程式碼審查（歷史：278 行安全骨架）
+## 4. 現行版本的工程風險與驗收條件
 
-### 4.1 P0 — 實車部署阻擋條件
-
-| ID | 檔案位置 | 觀察、影響與建議 |
+| 優先級 | 檔案／介面 | 現行狀態與待驗證事項 |
 | --- | --- | --- |
-| P0-01 | L53–57、85–95 | `hardware_enabled=True` 會直接拒絕啟動，`_connect_hardware()` 尚未實作。這是刻意的保護，不是目前可運行的馬達故障。保留停用狀態，待完整驅動、硬體型號與安全驗收完成才能部署。 |
-| P0-02 | L164–186 | 未來的硬體分支處理 torque 與一般命令時，未見明確的運行狀態互鎖。需要設計停用、待命、運行、故障的安全狀態規則並驗證。此分支目前不可達。 |
+| P0 | `dxl_arm.py`、`dxl_wheel.py`、實體設備 | 保留既有校正；設備型號、方向、模式、機械限位與獨立安全保護待確認 |
+| P0 | `aicar_base.py`、`aicar_teleop.py` | 有軟體逾時、錯誤與停止處理；不等於通訊失效、阻塞或失電時已證實安全停止 |
+| P1 | `aicar_base.py`、`aicar_odom.py` | Encoder 回繞、累計角度、Reset 順序已離線測試；硬體重啟、滑移、時間同步及實測精度待確認 |
+| P1 | `aicar_imu.py` | 有識別、讀取失敗及資料過期處理；實際晶片、量程、方向與 Bias 校正待驗證 |
+| P1 | `package.xml`、`setup.py`、Docker | ROS2 依賴已宣告、建置通過；正式硬體 SDK、I²C 與完整選配依賴仍須在目標環境驗收 |
+| P1 | URDF／TF、Launch | XML 與核心名稱測試通過；完整 RobotModel、Bridge 及實機啟動流程待驗證 |
+| P2 | `config/`、`launch/`、LiDAR／Camera | 保留現有資源；定位、導航、感知與多控制來源仲裁在擴充階段再驗證 |
 
-### 4.2 P1 — 高優先級
+停止相關設計應以有效回饋與獨立保護驗證，不能依賴軟體旗標或固定延遲來證明物理安全；離線測試未連接硬體，因此無法確認實際停止距離、支撐扭矩或機械限制。
 
-| ID | 檔案位置 | 觀察／修復方向 |
-| --- | --- | --- |
-| P1-01 | L80、144、148–156 | 逾時以 monotonic clock 衡量，卻由 ROS Timer 檢查；阻塞或模擬時間暫停可能推遲檢查。安全監控須與控制處理的失效情境一起設計、測試。 |
-| P1-02 | L118–129 | 手臂與工具指令只驗證部分格式，未見機械限制；需從實際硬體規格與驅動確認限制，不能猜測。 |
-| P1-03 | L102–109、172–174、198–202、221–227 | Reset 後的 Timer 再次清除 encoder baseline 狀態，可能使一筆增量被忽略；統一重設語義及基準建立時機。 |
-| P1-04 | L222–226 | 小於等於 2 ticks 的差分被歸零，且仍更新 last encoder；反覆微小移動可能永久丟失。保留原始有效增量，區分量測雜訊與位移。 |
-| P1-05 | L190–192、215–230 | 讀取四輪卻只發布前兩輪增量；這並非必然錯誤，但須核對 Odometry 下游採用的運動模型及後輪角色。 |
-| P1-06 | L190–192 | `Float32MultiArray` 沒有 Header，無法在訊息中直接標記取樣時刻；後續融合需有一致的時間與單位契約。 |
+## 5. 驗收範圍與版本界線
 
-### 4.3 P2 — 架構與維護
-
-| ID | 檔案位置 | 觀察／修復方向 |
-| --- | --- | --- |
-| P2-01 | L26–31 | 幾何、通訊及換算常數寫死。建議用不同部署配置與經驗證的參數來源；不要把 URDF 宣告值當成實車量測。 |
-| P2-02 | L68–71 | Joint 名稱寫死；需逐項與 URDF 比對。 |
-| P2-03 | L72–79 | 絕對 Topic 名稱不易部署多車 Namespace；後續可設計相對名稱與 Remapping。 |
-| P2-04 | L138–143 | 兩側命令獨立限制，飽和時可能改變預期曲率；先在無硬體的運動學測試中理解並確認需求。 |
-| P2-05 | L207–230 | 已有長度和有限數檢查，但回饋是否新鮮、編碼器單位／方向是否正確取決於尚未取得的驅動與配置。 |
-
-### 4.4 值得保留的設計
-
-- 硬體預設停用，且沒有不實的感測器回饋。
-- 非有限的 Twist 訊息不會被接受為有效運動要求。
-- 資料驗證、命令逾時、故障狀態及資源清理已有清楚的初步概念。
-- 驅動尚未驗證前拒絕連線，不假設 stub 回傳的零是真實量測。
-
-## 5. 待完整原碼審查的模組
-
-| 主題 | 應檢查的介面與證據 |
+| 項目 | 狀態 |
 | --- | --- |
-| DYNAMIXEL | 型號、協定、ID、量測單位、裝置錯誤處理、安全限制、故障與停用驗收 |
-| Odometry | 重構及離線測試完成；待 ROS2 CI、實車輪徑輪距、符號、時間、四輪模型、covariance 與重設驗證 |
-| IMU | 重構及離線測試完成；待 ROS2 CI 與座標、校準、頻率與 covariance 的實車驗證 |
-| TF | `map → odom → base_link` 的發布者責任；URDF link/joint 名稱一致；每條 TF 不應重複發布 |
-| ROS2 配置 | `package.xml`、依賴、Launch、參數預設、模擬／實車隔離、QoS |
-| Zenoh | Router、Domain ID、RMW、跨主機配置、時鐘、QoS、隔離與失效驗收 |
-| Gazebo | URDF/SDF、mesh、質量／慣量、關節、Bridge、`/clock`、模擬控制與資料一致性 |
+| Python/XML、79 項離線測試 | PASS |
+| AMD64 Jazzy 容器建置與四個假硬體 ROS2 smoke test | PASS |
+| 過往跨主機測試 Topic、時鐘與 Zenoh | 歷史驗證，詳見 [03](03-network-ssh.md)～[06](06-smoke-tests.md) |
+| 完整 RobotModel、Gazebo Bridge、實車動力學 | 尚未通過完整驗收，詳見 [07](07-gazebo-rviz2-aicar-experiment.md)、[08](08-aicar-hardware-urdf-physical-model.md) |
+| Nav2／SLAM | 已有配置與 Launch，曾啟動；尚未完成實機及資料驗證 |
+| 實車硬體、故障情境及定位精度 | 待驗證 |
 
-RViz2 的 `Fixed Frame` 必須存在於 TF Tree。模型顯示階段可先使用 URDF 的根 frame（例如 `base_link`），不要假造 `map`。`robot_state_publisher` 根據 URDF 與 JointState 提供關節座標。
+正式 Base 沒有獨立的 `hardware_enabled` 參數可作為離線保護。CI 使用測試替身且不掛載裝置或連接外部網路；詳見 [10](10-aicar-docker-deployment.md)。依照目前單車、單套件需求維持此架構，不新增尚未需要的框架。
 
-## 6. 測試與驗收計畫（待執行）
-
-| 測試 | 預期結果 | 環境 |
-| --- | --- | --- |
-| Python 語法檢查 | 通過 | 已完成 |
-| Node 硬體停用啟動 | 不連硬體、不發布實測回饋 | ROS2 模擬容器 |
-| 合成資料單元測試 | 量測長度、單位、基準與積分行為符合契約 | ROS2 模擬容器／純運算測試 |
-| URDF / TF | 關節名稱一致，無缺失的必要 frame | Gazebo / RViz2 |
-| Bridge 與時鐘 | Topic 型別、方向、時間一致 | Gazebo / ROS2 |
-| 跨主機資料測試 | 使用相容 middleware、QoS、正確時間 | 隔離的測試網路 |
-| 實車驗收 | 由有經驗人員在安全條件下驗證、包括獨立保護與量測 | 學校 |
-
-尚未執行的測試不能標示為通過。需要取得正式 ROS2 原始碼後，更新所有檔名、行號與結論。
-
-## 7. 學習筆記與修訂紀錄
-
-| 日期 | 閱讀段落 | 問題／理解 | 修訂狀態 |
-| --- | --- | --- | --- |
-| 2026-11-21 | L1–36 | 初始化前先理解模組責任、參數及單位 | 閱讀中；原碼未修改 |
-
-## 8. 參考資料
+## 6. 參考資料
 
 - [ROS2 Jazzy robot_state_publisher](https://github.com/ros/robot_state_publisher/tree/jazzy)
 - [ROS2 Jazzy rmw_zenoh](https://github.com/ros2/rmw_zenoh/tree/jazzy)

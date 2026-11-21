@@ -1,17 +1,17 @@
 # 08 — AICAR 車體資料、硬體清單與 URDF 物理模型
 
 > **版本**：2026-11-21；**狀態**：工程規格盤點 v0.1。
-> **閱讀原則**：「現場／程式已觀察」、「URDF 宣告值」、「官方歷史資料」與「待量測」不得混為一談。此份文件基於已提供的 AICAR 終端輸出與先前 URDF 解析紀錄；**尚未取得並逐行核對目前 ROS2 Jazzy 分支的完整 `ai_car.urdf` 檔案**，質心與各 Link 精確值需在實際工作區重新計算。
+> **閱讀原則**：「現場／程式已觀察」、「URDF 宣告值」、「官方歷史資料」與「待量測」不得混為一談。本文件已核對 Repository 內 `src/ai_car/urdf/ai_car.urdf` 的 XML 結構與宣告質量；整車質心及實體規格仍待量測。
 
 ## 1. 車輛概況
 
-AICAR 是以 **Raspberry Pi 4B** 為上層運算、**4 個驅動輪 + 3 個手臂／末端工具關節**的 ROS2 教學／實驗平台。實車透過 DYNAMIXEL 智慧伺服馬達控制；ROS2 Jazzy 運行 Ubuntu 24.04。2026-11-20 在學校電腦 WSL2 完成獨立 Gazebo 模擬驗證。
+AICAR 是以 **Raspberry Pi 4B** 為車端運算、**4 個驅動輪 + 3 個手臂／末端工具關節**的 ROS2 教學／實驗平台。實車透過 DYNAMIXEL 智慧伺服馬達控制；ROS2 Jazzy 運行 Ubuntu 24.04。2026-11-20 在開發端 WSL2 驗證 Gazebo 模型載入與關節回饋；位置控制及 RViz2 模型顯示尚未通過。
 
 ```text
                      Windows 11 / WSL2（開發、模擬、可視化）
                   ROS2 Jazzy / Gazebo / RViz2 / Zenoh Router
-                                | Ethernet
-                       Raspberry Pi 4B (car06)
+                                | Wi-Fi（目標）／Ethernet（診斷備援）
+                       Raspberry Pi 4B (robot-host)
                   ROS2 Base / IMU / Odometry / Sensors
                                 | U2D2 / DYNAMIXEL
              ┌──────────────────┴─────────────────┐
@@ -55,7 +55,7 @@ AICAR 是以 **Raspberry Pi 4B** 為上層運算、**4 個驅動輪 + 3 個手�
 | 驅動輪 | 四顆 DYNAMIXEL，ID 1=左前、2=右前、3=左後、4=右後 | 程式與實車通訊紀錄；**馬達確切型號待核對銘牌／SDK** |
 | 手臂／工具 | 三顆 DYNAMIXEL，ID 11、12、13 | 通訊與程式紀錄；確切型號、減速比待核對 |
 | 馬達介面 | ROBOTIS U2D2，Linux 裝置 `/dev/U2D2`、1,000,000 baud；現有測試使用 Protocol 1.0 | 現場程式測試紀錄；實機使用前仍須檢查裝置映射 |
-| IMU | MPU6050 | `aicar_imu` 相關程式與實測 ROS2 `/imu` 流程 |
+| IMU | 程式預期 MPU9250（WHO_AM_I 暫存器 `0x75`，預期回傳 `0x71`） | `aicar_imu.py` 設定；實體晶片型號與量測校正仍待現場確認 |
 | LiDAR | 配置了 `base_scan` 及 `/scan` 資料路徑 | **目前 LiDAR 產品／型號尚未查證**；不要從相似車輛推斷 |
 | 攝影機 | 專案／課程配置曾提及 Camera | **是否安裝、品牌與型號待現場確認** |
 | 車架／電池 | 客製車體、輪胎、手臂；電源額定規格未知 | 應拍照盤點電池容量、輸出電壓、配電保護 |
@@ -66,9 +66,9 @@ AICAR 是以 **Raspberry Pi 4B** 為上層運算、**4 個驅動輪 + 3 個手�
 - 該公開 README 提到 `rplidar_ros`、`RTIMU`、RViz 與 SLAM，但**不足以證明這台 ROS2 版實車的 LiDAR 型號、電池規格或馬達型號**。請以本車實體銘牌／ROS2 來源程式優先。
 - 本次沒有取得老師另一個硬體產品網站的明確網址，因此沒有將其宣稱為已核實來源。
 
-## 3. URDF 結構（先前解析紀錄，待全檔再核對）
+## 3. URDF 結構（Repository XML 盤點）
 
-來源路徑：`~/ros2_ws/src/ai_car/urdf/ai_car.urdf`，STL Mesh：`~/ros2_ws/src/ai_car/meshes/`。
+來源路徑：`src/ai_car/urdf/ai_car.urdf`，STL Mesh：`src/ai_car/meshes/`。
 
 - **11 Links、10 Joints**（包含一個虛擬的 `base_footprint` 及固定關節）。
 - `base_footprint` → fixed `base_joint` → `base_link`。
@@ -79,7 +79,7 @@ AICAR 是以 **Raspberry Pi 4B** 為上層運算、**4 個驅動輪 + 3 個手�
 
 ## 4. URDF 宣告的質量、慣量與幾何
 
-**警告：以下是模型檔宣告值（依本次對話中既有 URDF 解析結果），不是實際秤重或 CAD 重新驗算結果。**
+**警告：以下是模型檔宣告值，不是實際秤重或 CAD 重新驗算結果。** `base_footprint` 與 `imu_link` 沒有宣告質量。
 
 | 部件 | URDF 宣告質量 | 備註 |
 |---|---:|---|
@@ -96,6 +96,8 @@ AICAR 是以 **Raspberry Pi 4B** 為上層運算、**4 個驅動輪 + 3 個手�
 程式所用名義輪距約 **0.16 m**，輪半徑 **0.033 m**；四輪在左右兩側以差速速度命令驅動，轉彎可能發生輪胎側向滑移，不能直接將理想二輪差速模型當作完整四輪接觸動力學。
 
 `tool_joint` 在原 URDF：旋轉軸 `(0,0,1)`、角度範圍 `[0,1.57] rad`、速度宣告 50 rad/s、effort 宣告 1000、未定義 dynamics。這些是模型參數，**不代表伺服馬達真實額定性能**。
+
+目前 `constants.py` 中工具命令範圍為 0～45°，而 URDF 為約 0～90°。兩者責任不同：前者是程式命令範圍，後者是模型宣告；未實機驗證前不修改既有校正與限制。
 
 ## 5. 質心（Center of Mass / CoM）與慣量如何驗證
 
@@ -148,11 +150,12 @@ PY
 
 ```text
 /cmd_vel ──> aicar_base ──> 輪速計算 ──> DYNAMIXEL ID 1–4
+/wheel_torque ──> aicar_base（獨立車輪啟用要求）
 /joint, /tool, /torque ─> aicar_base ──> 臂部馬達 ID 11–13
                                ├─> /joint_states（七個 Joint）
-                               └─> /diff_rad（輪編碼器差量）
-MPU6050 ──> aicar_imu ──> /imu ─┐
-/diff_rad ──> aicar_odom ───────┴─> /odom + TF（odom→base_footprint）
+                               └─> /diff_rad（保留教學差量）
+IMU ──> aicar_imu ──> /imu ─┐
+/joint_states（累計角度與時間戳） ─> aicar_odom ─┴─> /odom + TF（odom→base_footprint）
 URDF + /joint_states ──> robot_state_publisher ──> TF ──> RViz2
 ```
 
@@ -171,7 +174,7 @@ URDF + /joint_states ──> robot_state_publisher ──> TF ──> RViz2
 |---|---|---|
 | P0 | 實車馬達型號／額定扭矩／控制模式 | 讀取馬達型號 Register、核對銘牌與官方型錄 |
 | P0 | LiDAR、Camera、電池、配電板實物型號 | 現場拍照、`lsusb`、`i2cdetect`、驅動設定檔 |
-| P0 | 完整 ROS2 URDF 資料、每 Link CoM、完整 inertia | 從正在使用的 Git Commit 讀檔、輸出盤點腳本 |
+| P1 | 各 Link CoM、完整 inertia 與指定姿態的整車 CoM | 已取得 URDF；依版本盤點與交叉驗算 |
 | P1 | 實測車重與重心、輪距與輪半徑 | 電子秤、幾何量測、姿態及接觸試驗 |
 | P1 | 實車速度／角速度與編碼器誤差 | 安全環境實測並記錄負載／電池狀態 |
 | P1 | Gazebo 物理接觸與 PID 振盪根因 | 對照實驗、固定模擬時間步長、輸出與碰撞診斷 |
@@ -180,4 +183,4 @@ URDF + /joint_states ──> robot_state_publisher ──> TF ──> RViz2
 
 - **當事系統輸出**：2026-11-20 學校 WSL2／Pi 的 `ros2`、`gz topic`、URDF 解析輸出及實驗畫面。
 - **教師公開上游**：[zhl017/ai_car GitHub](https://github.com/zhl017/ai_car)；其首頁目前是 ROS1 Noetic 操作手冊，而非本次 Jazzy 模型的逐行權威來源。
-- **本次未取得**：實際 ROS2 URDF 原檔及老師硬體產品規格網站。故質心座標、未知品牌型號和實測總重量均維持「待確認」。
+- **本次已取得**：Repository ROS2 URDF；未知品牌型號、實測總重量及指定姿態質心座標仍維持「待確認」。

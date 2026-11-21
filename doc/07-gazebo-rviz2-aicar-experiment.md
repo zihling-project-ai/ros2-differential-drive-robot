@@ -1,11 +1,12 @@
-# 07｜AICAR Gazebo 與 RViz2 驗證紀錄
+# 07｜AICAR Gazebo 與 RViz2 模擬實驗
 
 - **日期**：2026-11-20（Asia/Taipei）
 - **平台**：學校電腦 Windows 11／WSL2 Ubuntu 24.04、ROS 2 Jazzy、Gazebo Harmonic（Gazebo Sim 8.x）、RViz2
 - **對象**：AICAR 四輪底盤＋三個手臂／工具關節
 - **目的**：釐清 URDF、Gazebo 物理模擬、ROS 2 Topic／TF、RViz2 視覺化之間的責任分工
 - **執行範圍**：本機 WSL2 的模擬實驗；**未驗證實體車的馬達控制**
-- **本日結論**：Gazebo 模型與關節狀態讀取完成；關節位置控制出現不穩定振盪及車體漂移；RViz2 視窗已啟動，但**模型顯示尚未通過驗收**。
+- **驗證結論**：Gazebo 模型與關節狀態讀取完成；關節位置控制出現不穩定振盪及車體漂移；RViz2 視窗已啟動，但**模型顯示尚未通過驗收**。
+- **可重現性界線**：以下 SDF 與 RViz 專用 URDF 是歷史本機實驗副本，尚未納入 Repository；目前可取得正式 URDF 與 Mesh，但不能只 Clone 就完整重現這些實驗。
 
 ## 1. 系統架構與角色
 
@@ -38,7 +39,7 @@ Gazebo joint_state --ros_gz_bridge--> ROS 2 /sim/joint_states
 - Gazebo 可查詢 `/world/empty/pose/info`、`/world/empty/dynamic_pose/info`。
 - 最後截圖左側 Gazebo 可見 `aicar_hold_test` 模型、地面與車體。截圖當下介面呈暫停狀態，不能據此判斷模型當時是否正在移動。
 
-範例指令（需已安裝相應套件與存在本機工作目錄）：
+歷史實驗指令（需已安裝相應套件及另行取得本機 SDF）：
 
 ```bash
 export GZ_SIM_RESOURCE_PATH="$HOME/ros2_ws/src${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
@@ -143,9 +144,9 @@ z =  0.000007150 m
 
 當天曾準備本機 RViz 專用 URDF 副本 `gazebo_test/aicar_rviz.urdf`，將 `model://ai_car/meshes/` 轉為本機 `file://` 路徑，並規劃透過 `robot_state_publisher` 加 `/joint_states` 手動值展示模型；**尚未從截圖確認完整資料流已生效**。
 
-## 3. 下一次只需完成的 RViz2 驗收（優先）
+## 3. RViz2 觀測鏈驗收（待驗證）
 
-這不是今天已完成的結果，是**下一階段待辦**。先保持與實車隔離，不必執行 Gazebo 控制器。
+此為後續觀測鏈驗收方案，尚未執行完畢。保持與實車隔離，不必執行 Gazebo 控制器。
 
 1. 在相關 WSL2 終端使用相同且獨立的 ROS 2 環境，例如 `ROS_DOMAIN_ID=76`、`RMW_IMPLEMENTATION=rmw_fastrtps_cpp`、`ROS_LOCALHOST_ONLY=1`，並清除 `ZENOH_CONFIG_OVERRIDE`。另確認本機 Fast DDS 套件可用。
 2. 啟動使用 `aicar_rviz.urdf` 的 `robot_state_publisher`；確認 `/robot_description` 與 TF 有資料。
@@ -161,13 +162,13 @@ ros2 topic list | grep -E 'robot_description|joint_states|tf'
 ros2 topic echo /joint_states --once
 ```
 
-## 4. 後續控制實驗（延後，不影響今天收尾）
+## 4. 後續控制實驗（未納入目前核心驗收）
 
 - **B1：無控制器對照**：同場景、同起始姿態、同樣模擬時間，量測車體 x/y 變化，釐清是否只有加入控制器才偏移。
 - **B2：受限閉環控制**：核對質量／轉動慣量、物理時間步長、力矩／速度約束、關節阻尼及接觸參數，再由低輸出、低增益開始整定；記錄目標、位置、速度及收斂結果。
 - **B3：實車對映**：將 Gazebo 假設與實際 DYNAMIXEL 的扭矩啟用、Goal/Present Position、速度／負載能力分開驗證。未實測前不得將此模擬稱作經驗證的 Digital Twin。
 
-## 5. 今日學習驗收與重點
+## 5. 實驗驗收矩陣與工程判斷
 
 | 主題 | 狀態 |
 |---|---|
@@ -181,14 +182,14 @@ ros2 topic echo /joint_states --once
 | Gazebo → ROS 2 Bridge → RViz2 | NOT TESTED |
 | 實體 AICAR 位置控制／物理模型一致性 | NOT TESTED |
 
-**學習重點**：
+**設計判斷**：
 
 > URDF 描述機械結構；Gazebo 在物理世界中計算運動；控制器按照目標與回饋產生控制輸出；ROS 2 傳遞狀態與命令；RViz2 視覺化 ROS 2 的模型與資料。能看到機器人，不等於物理模擬正確；能啟動控制器，不等於控制穩定；能開啟 RViz2，不等於機器人模型已載入。
 
-**本次學習決策**：暫停 PID 參數整定；下一次先完成 RViz2 觀測鏈驗收，再決定是否橋接 Gazebo。這符合目前以 AI／機器人系統整合、可觀測性與可驗證資料流為優先的學習方向。
+**目前取捨**：暫不整定 PID 或宣稱數位分身已完成。先確立可觀測且可驗證的資料流，再決定是否擴充物理模型或橋接。模擬參數不能直接視為實車校正值。
 
 ## 6. 檔案與版本注意事項
 
 - 原始：`~/ros2_ws/src/ai_car/urdf/ai_car.urdf`（不修改）。
 - 測試：`gazebo_test/aicar_jointstate.sdf`、`gazebo_test/aicar_position_control.sdf`、`gazebo_test/aicar_rviz.urdf`（依先前操作產生；本紀錄**沒有重新連線查證本機檔案現在是否仍存在**）。
-- 本 Markdown 是整理紀錄，不代表已自動提交 GitHub 或寫入學校電腦的工作目錄。
+- Repository 收錄正式 URDF、Mesh 與本實驗紀錄；本機 SDF 副本不在版本控制內。若未來重現，應將可分發的實驗模型及版本一併管理。
