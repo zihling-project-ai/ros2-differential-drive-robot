@@ -69,7 +69,7 @@ P0/P1/P2 表示修復或驗收優先級，而非事故發生機率。第 4 節�
 | Teleop / Planner | 產生運動需求 | `cmd_vel` (`Twist`) |
 | Base Control | 解讀需求、協調底層驅動與狀態 | `cmd_vel`、`joint_states` |
 | DYNAMIXEL Driver | 硬體專屬通訊與回饋驗證 | Controller API（待確認） |
-| Odometry / IMU | 量測移動和姿態 | `odom`、`imu/data` |
+| Odometry / IMU | 量測旋轉速度、估算位姿 | `/odom`、`/imu`（本專案） |
 | State Estimation | 感測器融合 | Pose、TF |
 | URDF / State Publisher | 車體與關節座標關係 | `robot_description`、`tf`、`tf_static` |
 | Gazebo | 物理與感測器模擬 | Gazebo Transport、`ros_gz` |
@@ -155,6 +155,51 @@ Timer 觸發
 
 英文註解保留原教學步驟並補上設計原因。36 項假硬體離線測試已通過；ROS2 容器驗收與實車測試仍需分別追蹤。
 
+### `aicar_imu.py`（MPU9250）：量測介面與定位估算分離
+
+**模組目標：** 透過 I²C 取得陀螺儀 Z 軸角速度，以 ROS2 標準單位 rad/s 發布 `/imu` (`sensor_msgs/Imu`)。AICAR 為平面移動機器人，目前只需要 Yaw 角速度，不必為了擴充性立即實作完整九軸驅動。角度積分與位置估算由 `aicar_odom.py` 負責。
+
+```text
+MPU9250 (I²C, bus 1, address 0x68)
+  ↓ 讀取 Z 軸高、低位元組 (0x47, 0x48)
+  ↓ 合併 16-bit 並解碼二補數
+  ↓ 除以 131 LSB/(°/s)，轉為 °/s，再轉為 rad/s
+  ↓ 加上時間戳、imu_link 與量測有效性資訊
+/imu → aicar_odom.py（結合 /diff_rad）→ /odom、TF
+```
+
+| 函式 | 責任 |
+| --- | --- |
+| `__init__()` | 建立 Node、I²C、初始化、Topic、訊息與 200 Hz 目標 Timer |
+| `fn_init()` | 確認 MPU9250 裝置 ID、寫入並讀回電源與量程設定；並非校正或角度歸零 |
+| `fn_read_gyro_z()` | 讀取、解碼 16-bit 原始值，回傳 °/s |
+| `cb_timer()` | 轉為 rad/s、記錄量測時間、發布有效 IMU 訊息 |
+| `cb_reset()`（原版） | 原版收到 `/reset` 後重寫感測器設定；重構後移除共享 Reset 訂閱 |
+| `fn_shutdown()` / `main()` | 管理 ROS2 初始化、spin、關閉與 I²C 資源釋放 |
+
+**物理單位與數位編碼：** `raw = (high << 8) | low`；若 `raw >= 32768`，減去 `65536`，還原 −32768 至 32767 的有號值。此運算只改變數值解讀，並未轉換物理單位。例如 `0xFAE2` = 64226（unsigned）→ −1310（signed）→ −10 °/s → −0.17453 rad/s。量程 ±250 °/s（約 ±4.36 rad/s），原有 131 LSB/(°/s) 與量程配對保留。
+
+**積分與漂移：** `theta += angular_velocity * dt` 是 Odometry 的角度積分。假設靜止時陀螺儀有固定偏差 0.1 °/s，直接積分 60 秒便產生 6° 誤差；低通濾波可以降低高頻噪聲，卻不能保證消除固定偏差。現有 Odometry 在兩側 Encoder 增量皆零時以零角速度抑制靜止漂移，但輪子不轉不一定代表車體未受外力旋轉，且需另外檢查 IMU 資料時間與新鮮度。
+
+| 操作 | 改變的狀態 | 不代表 |
+| --- | --- | --- |
+| Initialization | 喚醒硬體、設定量程；確認通訊與有效量測 | 偏差已校正、航向已歸零 |
+| Calibration | 在已知靜止條件下估計角速度零點偏差，從後續量測扣除 | 車子回到起點或已消除全部漂移 |
+| Odometry Reset | 使軟體估算的 x、y、theta 與積分時間基準重新起算 | 實體移動、感測器重新通電或校正 |
+
+**設計決策：** 使用 `/reset` 不應無條件重新初始化 IMU；Odometry 歸零不需要改變量測硬體設定。若保留 IMU 的重初始化能力，應作為獨立的維護操作。校正值須由靜止實測取得，不在無硬體環境假造數值。200 Hz 是 ROS2 Timer 目標，不等於感測器實際取樣頻率。`orientation_covariance[0]` 與 `linear_acceleration_covariance[0]` 為 −1，表示未提供該類量測；不能把 X/Y 預設零誤認為實測值，通用融合前需明確限制使用 Z 軸並驗證 `imu_link` 與車體座標方向。
+
+| 優先度 | 審查問題（原版） | 修改與驗證方向 |
+| --- | --- | --- |
+| 高 | `abs(gz) >= 2.0` 直接歸零，隱藏量程內的有效旋轉 | 保留有效量測；不得以零代替通訊失敗或異常資料 |
+| 高 | I²C 初始化、讀取錯誤與關閉未完整處理 | 驗證初始化、讀取失敗不發布舊值／假值、確保 Bus 釋放 |
+| 中 | 高低位元組分開讀取可能跨樣本 | 改為連續讀取，確認長度與測試有號邊界 |
+| 中 | `/reset` 重寫硬體設定卻未校正 | 分離維護初始化、靜止校正與 Odometry 歸零 |
+| 中 | 未確認資料方向、偏差、頻率、時間戳與 covariance | 離線驗證訊息契約；實車靜止及已知角度驗收，之後設定可信參數 |
+| 低 | 轉換常數及外部依賴未明確說明 | `math.radians()`、英文註解；部署時確認 `smbus` 依賴 |
+
+**狀態（草稿 PR #6）：** 已重構正式 IMU Node，保留 `share/` 參考原版及原始硬體參數。新增 `python3-smbus` 執行依賴；10 項 IMU 假硬體測試與既有 36 項測試全部通過（共 46 項）。ROS2 容器 IMU smoke test 已加入 CI，待本次執行結果。尚未實測裝置 ID、I²C 連續讀取、量測頻率、校正及座標；若校方板卡不是預期 MPU9250，應先辨識型號而非直接跳過 ID 檢查。先維持單一 Node，不引入 EKF 或新的驅動架構；IMU 讀取失敗時停止發布，但 Odometry 目前仍可能使用最後一次角速度，須在下階段修正資料過期處理。
+
 ## 4. 第一輪程式碼審查（歷史：278 行安全骨架）
 
 ### 4.1 P0 — 實車部署阻擋條件
@@ -198,7 +243,7 @@ Timer 觸發
 | --- | --- |
 | DYNAMIXEL | 型號、協定、ID、量測單位、裝置錯誤處理、安全限制、故障與停用驗收 |
 | Odometry | 輪徑與輪距、四輪模型、符號、時間差、Pose/Twist、covariance、重設語義 |
-| IMU | 單位、座標方向、安裝姿態、校準、時間戳、covariance、是否具有可信 orientation |
+| IMU | 重構及離線測試完成；待 ROS2 CI 與座標、校準、頻率與 covariance 的實車驗證 |
 | TF | `map → odom → base_link` 的發布者責任；URDF link/joint 名稱一致；每條 TF 不應重複發布 |
 | ROS2 配置 | `package.xml`、依賴、Launch、參數預設、模擬／實車隔離、QoS |
 | Zenoh | Router、Domain ID、RMW、跨主機配置、時鐘、QoS、隔離與失效驗收 |
@@ -230,5 +275,9 @@ RViz2 的 `Fixed Frame` 必須存在於 TF Tree。模型顯示階段可先使用
 
 - [ROS2 Jazzy robot_state_publisher](https://github.com/ros/robot_state_publisher/tree/jazzy)
 - [ROS2 Jazzy rmw_zenoh](https://github.com/ros2/rmw_zenoh/tree/jazzy)
+- [ROS2 Jazzy sensor_msgs/Imu 訊息定義](https://github.com/ros2/common_interfaces/blob/jazzy/sensor_msgs/msg/Imu.msg)
+- [REP-103：單位與座標規範](https://github.com/ros-infrastructure/rep/blob/master/rep-0103.rst)
+- [TDK MPU9250 Register Map](https://invensense.tdk.com/wp-content/uploads/2015/02/MPU-9250-Register-Map.pdf)
+- [Analog Devices：Gyroscope Calibration](https://www.analog.com/media/en/technical-documentation/technical-articles/gyrocalibration_edn_eu_7_2010.pdf)
 - [Gazebo 與 ROS 相容版本](https://gazebosim.org/docs/harmonic/ros_installation/)
 - [10｜跨環境部署與 Docker](10-aicar-docker-deployment.md)

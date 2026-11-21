@@ -64,6 +64,7 @@ jobs:
               source install/setup.bash
               ros2 pkg prefix ai_car
               python3 src/ai_car/test/ros_base_smoke.py
+              python3 src/ai_car/test/ros_imu_smoke.py
             '
 
       # No hardware access, robot launch, motor commands, or deployment in CI.
