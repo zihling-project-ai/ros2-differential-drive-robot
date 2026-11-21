@@ -75,6 +75,9 @@ class AICAR_TELEOP(Node):
         self.j1 = self.j2 = self.tool = 0
 
         # --- Subscribers ---
+        # Teacher TODO (completed): create two subscribers and bind callbacks.
+        #   /joint_states (JointState) -> cb_joint_states
+        #   /reset        (Empty)      -> cb_reset
         self.joint_states_sub = self.create_subscription(JointState, '/joint_states', self.cb_joint_states, 10)
         self.reset_sub = self.create_subscription(Empty, '/reset', self.cb_reset, 10)
         # Observe explicit enable/disable requests only to discard old targets.
@@ -83,13 +86,26 @@ class AICAR_TELEOP(Node):
         self.wheel_torque_sub = self.create_subscription(Int8, '/wheel_torque', self.cb_wheel_torque, 10)
 
         # --- Publishers: retain original command types and topics ---
+        # Teacher TODO (completed): create the three command publishers.
+        #   /cmd_vel (Twist)           -> cmd_pub,   depth=1
+        #   /joint   (Int32MultiArray) -> joint_pub, depth=1
+        #   /tool    (Int32)           -> tool_pub,  depth=1
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 1)
         self.joint_pub = self.create_publisher(Int32MultiArray, '/joint', 1)
         self.tool_pub = self.create_publisher(Int32, '/tool', 1)
 
     # --- Subscriber callbacks ---
     def cb_joint_states(self, msg):
-        """Initialize targets from fresh named joints, not fixed array indexes."""
+        """Teacher TODO (original exercise):
+
+        1. When get_arm_data is False, read positions[4:7], convert radians
+           to integer degrees and store j1, j2 and tool.
+        2. Log the initial arm angles.
+        3. Set get_arm_data to True.
+
+        Current design: resolve joints by name, validate feedback and time,
+        and re-synchronize after a reset, torque request or feedback outage.
+        """
         with self.lock:
             now = time.monotonic()
             ros_now = self.get_clock().now().nanoseconds
@@ -141,7 +157,14 @@ class AICAR_TELEOP(Node):
         self.arm_cutoff_ns = self.get_clock().now().nanoseconds
 
     def cb_reset(self, msg):
-        """Stop wheel targets and request a new arm baseline, not a home pose."""
+        """Teacher TODO (original exercise):
+
+        1. Log [ SET ] TELEOP reset.
+        2. Reset j1, j2, tool, lin_vel and ang_vel to zero.
+
+        Current design: zero the velocity targets but invalidate and re-read
+        measured arm positions instead of assuming the arm has homed.
+        """
         with self.lock:
             self._stop_wheels()
             self._invalidate_arm()
@@ -174,6 +197,14 @@ class AICAR_TELEOP(Node):
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def fn_wheel_pub(self):
+        """Teacher TODO (original exercise):
+
+        1. Log the linear and angular wheel command.
+        2. Create a Twist, assign lin_vel and ang_vel, and publish it.
+
+        Current design: retain the message publication; omit per-refresh
+        logging so repeated velocity updates do not flood the terminal.
+        """
         # Publish desired body velocity; Base alone handles motor commands.
         cmd = Twist()
         cmd.linear.x = float(self.lin_vel)
@@ -181,6 +212,15 @@ class AICAR_TELEOP(Node):
         self.cmd_pub.publish(cmd)
 
     def fn_arm_pub(self, joint=False, tool=False):
+        """Teacher TODO (original exercise):
+
+        1. Log j1, j2 and tool.
+        2. Create Int32MultiArray with [j1, j2] and publish to /joint.
+        3. Create Int32 with tool and publish to /tool.
+
+        Current design: publish only the requested group and omit repeated
+        command logging. Explicit Home Pose requests both groups.
+        """
         # Send only the requested group; only an explicit home requests both.
         if joint:
             joint_msg = Int32MultiArray()
@@ -244,7 +284,20 @@ class AICAR_TELEOP(Node):
                 self.fn_wheel_pub()
 
     def fn_run(self):
-        """Teacher steps: show controls, read keys, publish, stop and restore terminal."""
+        """Teacher TODO (original keyboard-control exercise):
+
+        1. Print the controls in msg.
+        2. Run a loop and read one key with fn_get_key().
+        3. Map keys to increment/decrement targets and publish commands:
+           w/x: linear velocity; a/d: angular velocity;
+           u/j: Joint 1; i/k: Joint 2; o/l: Tool;
+           h: request the home pose; s: request zero wheel velocity;
+           Ctrl+C: exit. The exercise also reprinted the menu every 20 keys.
+        4. In finally, request a stop and restore the terminal settings.
+
+        Current design: delegate key mapping to _handle_key(), limit command
+        lifetime, exit on ROS shutdown or EOF, and print the menu only once.
+        """
         if not sys.stdin.isatty():
             raise RuntimeError('Teleop requires an interactive terminal')
         settings = termios.tcgetattr(sys.stdin)

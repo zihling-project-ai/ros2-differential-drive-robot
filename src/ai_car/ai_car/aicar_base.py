@@ -119,7 +119,8 @@ class AICAR_BASE(Node):
                 raise ValueError('command_timeout_sec must be finite and positive')
 
             # --- Initialize the DYNAMIXEL port ---
-            # Teacher steps: create PortHandler, open port, set baud rate, log success.
+            # Teacher TODO (completed): create PortHandler, connect to U2D2,
+            # set the baud rate, and report successful initialization.
             # SDK methods return status values; a lack of exceptions is not proof of success.
             self.get_logger().info('Connect U2D2 ...')
             self.dxl_port = PortHandler('/dev/U2D2')
@@ -128,14 +129,19 @@ class AICAR_BASE(Node):
             if not self.dxl_port.setBaudRate(BAUD_RATE):
                 raise RuntimeError('Cannot configure DYNAMIXEL baud rate')
 
-            # Teacher step: construct both controllers using one shared port.
+            # Teacher TODO (completed): create Arm_Controller and Wheel_Controller.
             # Verify and request a wheel stop first; creating a controller must
             # not authorize motion or automatically home the arm.
             self.wheel = Wheel_Controller(self.dxl_port)
             self.arm = Arm_Controller(self.dxl_port)
 
             # --- Subscribers ---
-            # Teacher steps: register the original five interfaces and callbacks.
+            # Teacher TODO (completed): create five subscribers and bind callbacks.
+            #   /reset   (Empty)           -> cb_reset
+            #   /torque  (Int8)            -> cb_torque
+            #   /tool    (Int32)           -> cb_tool
+            #   /joint   (Int32MultiArray) -> cb_joint
+            #   /cmd_vel (Twist)           -> cb_cmd
             # Preserve /torque as arm-only; a separate request enables the wheels.
             self.reset_sub = self.create_subscription(Empty, '/reset', self.cb_reset, 10)
             self.torque_sub = self.create_subscription(Int8, '/torque', self.cb_torque, 10)
@@ -147,7 +153,9 @@ class AICAR_BASE(Node):
             )
 
             # --- Publishers ---
-            # Teacher steps: publish JointState and left/right angular increments.
+            # Teacher TODO (completed): create two publishers.
+            #   /joint_states (JointState),        depth=1
+            #   /diff_rad     (Float32MultiArray), depth=1
             self.joint_states_pub = self.create_publisher(JointState, '/joint_states', 1)
             self.diff_rad_pub = self.create_publisher(Float32MultiArray, '/diff_rad', 1)
 
@@ -160,7 +168,7 @@ class AICAR_BASE(Node):
             ]
 
             # --- Main control timer (30 Hz) ---
-            # Teacher step: periodically read feedback and handle queued commands.
+            # Teacher TODO (completed): create a 30 Hz timer bound to cb_timer.
             # Use steady time for watchdog scheduling, so ROS-time jumps cannot
             # extend freshness. Message stamps still use the ROS clock.
             self.timer = self.create_timer(
@@ -176,7 +184,17 @@ class AICAR_BASE(Node):
     # --- Subscriber callbacks ---
 
     def cb_reset(self, msg):
-        """Teacher steps: log reset, clear odometry baseline, set reset flag."""
+        """Teacher TODO (original exercise):
+
+        1. Log [ SET ] AICAR reset.
+        2. Clear the accumulated and previous encoder values.
+        3. Set state_is_reset to False.
+        4. Set reset_received to True.
+
+        Current design: invalidate pending commands and defer hardware work to
+        the timer. Rebuild the raw tick baseline without clearing cumulative
+        JointState angles; Odometry owns the pose origin.
+        """
         if self.closed or self.faulted:
             return
         self.get_logger().info('[ SET ] AICAR reset')
@@ -185,7 +203,14 @@ class AICAR_BASE(Node):
         self.reset_received = True
 
     def cb_torque(self, msg):
-        """Teacher steps: read, log and store the arm torque request."""
+        """Teacher TODO (completed):
+
+        1. Log [ SET ] ARM Torque and the received value.
+        2. Store torque_data.
+        3. Set torque_received to True.
+
+        The current callback also validates the request and prioritizes disable.
+        """
         if self.closed or self.faulted:
             return
         if msg.data not in (0, 1):
@@ -213,7 +238,15 @@ class AICAR_BASE(Node):
         self._clear_wheel_command()
 
     def cb_tool(self, msg):
-        """Teacher steps: validate, log and store the tool target and pending flag."""
+        """Teacher TODO (original exercise):
+
+        1. If tool_received is False, log [ SET ] ARM Tool and the target.
+        2. Store tool_data.
+        3. Set tool_received to True.
+
+        Current design: validate authorization and use the latest valid target
+        instead of retaining the first pending command.
+        """
         if self.closed or self.faulted or not self.arm_enabled or self.reset_received:
             return
         if not TOOL_MIN_DEG <= msg.data <= TOOL_MAX_DEG:
@@ -227,7 +260,14 @@ class AICAR_BASE(Node):
         self.tool_received = True
 
     def cb_joint(self, msg):
-        """Teacher steps: validate, log and store two joint targets and pending flag."""
+        """Teacher TODO (original exercise):
+
+        1. If joint_received is False, log [ SET ] ARM Joint and both targets.
+        2. Store joint_data.
+        3. Set joint_received to True.
+
+        Current design: validate both angles and retain the latest valid target.
+        """
         if self.closed or self.faulted or not self.arm_enabled or self.reset_received:
             return
         if len(msg.data) != 2 or not all(JOINT_MIN_DEG <= angle <= JOINT_MAX_DEG for angle in msg.data):
@@ -240,7 +280,18 @@ class AICAR_BASE(Node):
         self.joint_received = True
 
     def cb_cmd(self, msg):
-        """Teacher steps: read Twist, convert wheel speeds, limit, log and store."""
+        """Teacher TODO (original exercise):
+
+        1. If cmd_received is False, calculate left and right wheel speeds
+           from Twist.linear.x and Twist.angular.z using the wheel separation.
+        2. Convert wheel speeds to DYNAMIXEL values using wheel radius and scale.
+        3. Limit the converted values with constrain().
+        4. Log [ SET ] WHEEL and the two integer targets.
+        5. Store cmd_data and set cmd_received to True.
+
+        Current design: use latest-wins after validation, scale both wheels
+        proportionally, prioritize stop requests, and record command freshness.
+        """
         if (self.closed or self.faulted or not self.wheel_enabled or self.reset_received
                 or self.wheel_torque_received or self.wheel_stop_requested):
             return
@@ -269,9 +320,21 @@ class AICAR_BASE(Node):
 
     def cb_timer(self):
         """
-        Teacher tasks: update states; publish joint states and diff_rad; process
-        tool, joint, wheel, reset and torque requests. Safety-related requests
-        are now handled first so stale or pending movement cannot outrank a stop.
+        Teacher TODO (original exercise, historical order):
+
+        1. Call fn_update_states() to read sensor feedback.
+        2. Publish /joint_states with all seven joint positions.
+        3. Publish /diff_rad with the left and right wheel increments.
+        4. If tool_received, call arm.set_tool() and clear the flag.
+        5. If joint_received, call arm.set_joint() and clear the flag.
+        6. If cmd_received, call wheel.set_wheel() and clear the flag.
+        7. If reset_received, the exercise called arm.reset() and wheel.reset(),
+           scheduled cb_flag after two seconds, and cleared the flag.
+        8. If torque_received, call arm.set_torque() and clear the flag.
+
+        Current design: the same responsibilities are retained, but stopping,
+        expiry and reset take priority over ordinary motion and feedback.
+        The historical arm homing and cb_flag timer are not executed.
         """
         if self.closed or self.faulted:
             return
@@ -280,6 +343,8 @@ class AICAR_BASE(Node):
             # The original teacher reset changed motor modes, homed the arm and
             # used a 2-second cb_flag timer. A valid encoder sample is the new
             # baseline; shared odometry reset must not unexpectedly move the arm.
+            # Historical cb_flag TODO: set state_is_reset to False. The current
+            # last_wheel_ticks = None baseline replaces this timer callback.
             if self.reset_received:
                 self._clear_motion_commands()
                 self.wheel.reset()
@@ -377,8 +442,18 @@ class AICAR_BASE(Node):
 
     def fn_update_states(self):
         """
-        Teacher steps: read arm and wheel feedback, initialize last ticks on the
-        first sample, calculate increments, add to total, update last ticks.
+        Teacher TODO (original exercise):
+
+        1. Read arm_states with arm.get_arm().
+        2. Read wheel_states with wheel.get_wheel().
+        3. If state_is_reset is False, initialize all four last encoder values
+           from the current readings, then mark the baseline ready.
+        4. For each wheel, calculate diff = (current - last) * XM_TICK2RAD,
+           treat increments of at most two ticks as noise, accumulate total,
+           and store the new last value.
+
+        Current design: use None to mark a new baseline, handle signed rollover,
+        and retain valid small increments to avoid losing low-speed travel.
         """
         arm = list(self.arm.get_arm())
         wheels = list(self.wheel.get_wheel())
@@ -434,9 +509,18 @@ class AICAR_BASE(Node):
 
     def fn_shutdown(self):
         """
-        Teacher shutdown tasks: log, stop wheels, handle torque and close the port.
-        Do not run the original automatic arm home or arbitrary 3-second sleep:
-        new motion during shutdown and elapsed time are not a verified safe state.
+        Teacher TODO (original exercise, historical order):
+
+        1. Report that the program is exiting.
+        2. The original exercise called arm.reset().
+        3. Request zero wheel velocity with wheel.set_wheel([0, 0]).
+        4. The original exercise waited three seconds.
+        5. The original exercise disabled arm and wheel torque.
+        6. Close the DYNAMIXEL port.
+
+        Current design: prioritize stopping, attempt independent cleanup actions,
+        and do not request automatic homing, assume a fixed delay proves a stop,
+        or remove support torque from the arm during shutdown.
         """
         if self.closed:
             return
