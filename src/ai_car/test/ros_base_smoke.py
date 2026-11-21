@@ -11,8 +11,10 @@ fake_sdk = ModuleType('dynamixel_sdk')
 fake_sdk.COMM_SUCCESS = 0
 fake_sdk.PacketHandler = Mock()
 fake_sdk.PortHandler = Mock()
-with patch.dict(sys.modules, {'dynamixel_sdk': fake_sdk}):
-    from ai_car import aicar_base
+# This smoke test runs in its own process. Do not restore all of sys.modules:
+# ROS imports must keep their class identities for Node and TimeSource.
+sys.modules['dynamixel_sdk'] = fake_sdk
+from ai_car import aicar_base
 
 
 def main():
