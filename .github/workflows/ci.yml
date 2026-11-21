@@ -1,0 +1,65 @@
+name: AICAR CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check Python syntax and package metadata without importing drivers
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          sources = sorted(Path('src/ai_car').rglob('*.py'))
+          assert sources, 'No AICAR Python files found'
+          for path in sources:
+              ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+          package = ET.parse('src/ai_car/package.xml').getroot()
+          assert package.findtext('name') == 'ai_car'
+          ET.parse('src/ai_car/urdf/ai_car.urdf')
+          print(f'Parsed {len(sources)} Python files, package.xml, and URDF XML')
+          PY
+
+  ros2-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build the Jazzy development image
+        run: docker build -f docker/Dockerfile -t aicar-dev:ci .
+
+      - name: Build and discover the ROS 2 package in an isolated container
+        run: |
+          docker run --rm --network none \
+            --mount type=bind,source="$GITHUB_WORKSPACE/src",target=/input,readonly \
+            aicar-dev:ci bash -lc '
+              set -e
+              cp -a /input /workspace/src
+              source /opt/ros/jazzy/setup.bash
+              colcon build --packages-select ai_car
+              source install/setup.bash
+              ros2 pkg prefix ai_car
+            '
+
+      # No hardware access, robot launch, motor commands, or deployment in CI.

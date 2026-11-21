@@ -1,0 +1,11 @@
+.git
+.github
+.vscode
+doc
+build
+install
+log
+**/__pycache__
+**/*.pyc
+.env
+.env.*
