@@ -16,13 +16,17 @@ from std_msgs.msg import Empty, Float32MultiArray, Int8, Int32, Int32MultiArray
 
 # Hardware transport and driver interfaces
 from dynamixel_sdk import PortHandler
-from ai_car.dxl_arm import Arm_Controller, JOINT_MAX_DEG, TOOL_MAX_DEG
+from ai_car.dxl_arm import Arm_Controller
 from ai_car.dxl_wheel import Wheel_Controller, VELOCITY_COMMAND_LIMIT, XM_TICK2RAD
 
-# --- Original hardware and vehicle parameters ---
+# Shared robot geometry and interface constants
+from ai_car.constants import (
+    ARM_NAMES, JOINT_MIN_DEG, JOINT_MAX_DEG, TOOL_MIN_DEG, TOOL_MAX_DEG,
+    WHEEL_RADIUS, WHEEL_SEPARATION,
+)
+
+# --- Original hardware transport and conversion parameters ---
 BAUD_RATE = 1000000
-WHEEL_SEPARATION = 0.16  # Left-to-right wheel center distance (m).
-WHEEL_RADIUS = 0.033      # Rolling radius (m).
 VELOCITY2VALUE = 41.69988758  # Motor velocity units per rad/s.
 LIMIT_VEL = VELOCITY_COMMAND_LIMIT  # Shared software limit, not a measured hardware limit.
 
@@ -155,9 +159,7 @@ class AICAR_BASE(Node):
                 'wheel_right_joint',
                 'wheel_rear_left_joint',
                 'wheel_rear_right_joint',
-                'arm_joint_1',
-                'arm_joint_2',
-                'tool_joint',
+                *ARM_NAMES,
             ]
 
             # --- Main control timer (30 Hz) ---
@@ -217,7 +219,7 @@ class AICAR_BASE(Node):
         """Teacher steps: validate, log and store the tool target and pending flag."""
         if self.closed or self.faulted or not self.arm_enabled or self.reset_received:
             return
-        if not 0 <= msg.data <= TOOL_MAX_DEG:
+        if not TOOL_MIN_DEG <= msg.data <= TOOL_MAX_DEG:
             self.get_logger().warning('Invalid tool angle')
             return
         if self.torque_received:
@@ -231,7 +233,7 @@ class AICAR_BASE(Node):
         """Teacher steps: validate, log and store two joint targets and pending flag."""
         if self.closed or self.faulted or not self.arm_enabled or self.reset_received:
             return
-        if len(msg.data) != 2 or not all(0 <= angle <= JOINT_MAX_DEG for angle in msg.data):
+        if len(msg.data) != 2 or not all(JOINT_MIN_DEG <= angle <= JOINT_MAX_DEG for angle in msg.data):
             self.get_logger().warning('Expected two valid joint angles')
             return
         if self.torque_received:

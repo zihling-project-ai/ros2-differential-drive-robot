@@ -3,6 +3,9 @@
 import math
 import time
 from dynamixel_sdk import COMM_SUCCESS, PacketHandler
+from ai_car.constants import (
+    HOME_POS, HOME_TOOL, JOINT_MIN_DEG, JOINT_MAX_DEG, TOOL_MIN_DEG, TOOL_MAX_DEG,
+)
 
 AX_LED_ADDRESS = 25
 AX_TORQUE_ADDRESS = 24
@@ -20,23 +23,17 @@ JOINT_1_ZERO_TICK = 812
 JOINT_2_ZERO_TICK = 212
 TOOL_ZERO_TICK = 420
 
-# Existing teleop command limits, not measured mechanical limits.
-JOINT_MAX_DEG = 90
-TOOL_MAX_DEG = 45
 AX_MAX_POSITION_TICK = 1023
-
-HOME_POS = [0, 0]
-HOME_TOOL = 0
 
 AX_TICK2DEG = 300.0 / 1024
 AX_TICK2RAD = math.radians(AX_TICK2DEG)
 
 
-def angle_to_ticks(angle_deg, max_angle_deg):
+def angle_to_ticks(angle_deg, max_angle_deg, min_angle_deg=JOINT_MIN_DEG):
     if isinstance(angle_deg, bool) or not isinstance(angle_deg, (int, float)):
         raise ValueError('Angle must be a number in degrees')
-    if not 0 <= angle_deg <= max_angle_deg:
-        raise ValueError(f'Angle must be within 0–{max_angle_deg} degrees')
+    if not min_angle_deg <= angle_deg <= max_angle_deg:
+        raise ValueError(f'Angle must be within {min_angle_deg}–{max_angle_deg} degrees')
     return int(angle_deg / AX_TICK2DEG)
 
 
@@ -104,7 +101,7 @@ class Arm_Controller:
             self._check_result(motor_id, 'set joint position', result, error)
 
     def set_tool(self, set_data):
-        tool_tick = TOOL_ZERO_TICK + angle_to_ticks(set_data, TOOL_MAX_DEG)
+        tool_tick = TOOL_ZERO_TICK + angle_to_ticks(set_data, TOOL_MAX_DEG, TOOL_MIN_DEG)
         validate_position_tick(tool_tick)
         result, error = self.packet.write2ByteTxRx(
             self.port, ARM_TOOL, AX_GOAL_POSITION, tool_tick

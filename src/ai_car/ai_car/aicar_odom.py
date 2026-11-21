@@ -15,9 +15,9 @@ from sensor_msgs.msg import Imu
 # Coordinate transformations
 import tf2_ros
 
-# Original hardware geometry (meters)
-WHEEL_RADIUS = 0.033
-WHEEL_SEPARATION = 0.16  # Reserved for wheel-based yaw estimation.
+# Shared robot geometry and frame identifier
+from ai_car.constants import IMU_FRAME_ID, WHEEL_RADIUS
+
 IMU_TIMEOUT_SEC = 0.1  # Provisional; verify on the actual transport.
 MAX_ODOM_DT_SEC = 0.2  # Reject gaps instead of integrating stale measurements.
 
@@ -70,7 +70,7 @@ class AICAR_ODOM(Node):
         now = self._observe_clock()
         stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
         age = (now.nanoseconds - stamp) / 1e9
-        if (msg.header.frame_id != 'imu_link' or not isfinite(msg.angular_velocity.z) or
+        if (msg.header.frame_id != IMU_FRAME_ID or not isfinite(msg.angular_velocity.z) or
                 msg.angular_velocity_covariance[0] == -1.0 or stamp <= 0 or
                 not 0.0 <= age <= IMU_TIMEOUT_SEC or
                 (self.reset_stamp_ns is not None and stamp <= self.reset_stamp_ns) or

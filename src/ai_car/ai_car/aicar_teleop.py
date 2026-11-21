@@ -17,12 +17,13 @@ from std_msgs.msg import Empty, Int8, Int32, Int32MultiArray
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import JointState
 
-# Original operator limits (m/s, rad/s, degrees), not certified safety limits.
+from ai_car.constants import (
+    ARM_NAMES, HOME_POS, HOME_TOOL, JOINT_MIN_DEG, JOINT_MAX_DEG, TOOL_MIN_DEG, TOOL_MAX_DEG,
+)
+
+# Original operator velocity limits (m/s, rad/s), not certified safety limits.
 MAX_LIN_VEL = 0.15
 MAX_ANG_VEL = 4.5
-MAX_J1, MIN_J1 = 90, 0
-MAX_J2, MIN_J2 = 90, 0
-MAX_TOOL, MIN_TOOL = 45, 0
 
 # Restore the teacher's gradual increments instead of jumping to full speed.
 STEP_LIN = 0.01
@@ -33,7 +34,6 @@ STEP_ARM = 2
 KEY_TIMEOUT_SEC = 0.3
 KEY_POLL_SEC = 0.1
 ARM_FEEDBACK_TIMEOUT_SEC = 0.5
-ARM_NAMES = ('arm_joint_1', 'arm_joint_2', 'tool_joint')
 
 msg = """
 Control Your AICAR!
@@ -115,7 +115,8 @@ class AICAR_TELEOP(Node):
                 return
             angles = [round(value) for value in degrees]
             if not all(low <= value <= high for value, low, high in
-                       zip(angles, (MIN_J1, MIN_J2, MIN_TOOL), (MAX_J1, MAX_J2, MAX_TOOL))):
+                       zip(angles, (JOINT_MIN_DEG, JOINT_MIN_DEG, TOOL_MIN_DEG),
+                           (JOINT_MAX_DEG, JOINT_MAX_DEG, TOOL_MAX_DEG))):
                 self.get_arm_data = False
                 self.last_arm_received = None
                 return
@@ -222,16 +223,20 @@ class AICAR_TELEOP(Node):
                     self.get_arm_data = False
                     self.get_logger().warning('Waiting for fresh arm feedback', throttle_duration_sec=1.0)
                 elif key == 'h':
-                    self.j1 = self.j2 = self.tool = 0
+                    self.j1, self.j2 = HOME_POS
+                    self.tool = HOME_TOOL
                     self.fn_arm_pub(joint=True, tool=True)
                 elif key in ('u', 'j'):
-                    self.j1 = constrain(self.j1 + (STEP_ARM if key == 'u' else -STEP_ARM), MAX_J1, MIN_J1)
+                    self.j1 = constrain(self.j1 + (STEP_ARM if key == 'u' else -STEP_ARM),
+                                        JOINT_MAX_DEG, JOINT_MIN_DEG)
                     self.fn_arm_pub(joint=True)
                 elif key in ('i', 'k'):
-                    self.j2 = constrain(self.j2 + (STEP_ARM if key == 'i' else -STEP_ARM), MAX_J2, MIN_J2)
+                    self.j2 = constrain(self.j2 + (STEP_ARM if key == 'i' else -STEP_ARM),
+                                        JOINT_MAX_DEG, JOINT_MIN_DEG)
                     self.fn_arm_pub(joint=True)
                 else:
-                    self.tool = constrain(self.tool + (STEP_ARM if key == 'o' else -STEP_ARM), MAX_TOOL, MIN_TOOL)
+                    self.tool = constrain(self.tool + (STEP_ARM if key == 'o' else -STEP_ARM),
+                                          TOOL_MAX_DEG, TOOL_MIN_DEG)
                     self.fn_arm_pub(tool=True)
 
             # Refresh a bounded user input lease, never a latched old velocity.

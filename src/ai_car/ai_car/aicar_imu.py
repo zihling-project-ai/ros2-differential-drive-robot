@@ -11,6 +11,8 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
 
+from ai_car.constants import IMU_FRAME_ID
+
 I2C_BUS     = 1
 I2C_ADDRESS = 0x68
 IMU_RATE    = 200  # Hz
@@ -42,7 +44,7 @@ class AICAR_IMU(Node):
 
             # 3. Describe only the measurements this driver provides.
             self.imu_msg = Imu()
-            self.imu_msg.header.frame_id = 'imu_link'
+            self.imu_msg.header.frame_id = IMU_FRAME_ID
             self.imu_msg.orientation_covariance[0] = -1.0
             self.imu_msg.linear_acceleration_covariance[0] = -1.0
             # Only angular_velocity.z is measured; other axes are not measured.
