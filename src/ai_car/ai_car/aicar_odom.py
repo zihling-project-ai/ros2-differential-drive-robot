@@ -8,17 +8,18 @@ import time
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Empty, Float32MultiArray
+from std_msgs.msg import Empty
 from geometry_msgs.msg import TransformStamped
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, JointState
 
 # Coordinate transformations
 import tf2_ros
 
 # Shared robot geometry and frame identifier
-from ai_car.constants import IMU_FRAME_ID, WHEEL_RADIUS
+from ai_car.constants import IMU_FRAME_ID, WHEEL_NAMES, WHEEL_RADIUS
 
 IMU_TIMEOUT_SEC = 0.1  # Provisional; verify on the actual transport.
+WHEEL_FEEDBACK_TIMEOUT_SEC = 0.2  # Reject delayed wheel measurements.
 MAX_ODOM_DT_SEC = 0.2  # Reject gaps instead of integrating stale measurements.
 
 
@@ -39,11 +40,12 @@ class AICAR_ODOM(Node):
         self.y = 0.0
         self.theta = 0.0
         # The first valid wheel sample establishes a time baseline only.
-        self.last_time = None
+        self.last_wheel_stamp_ns = None
+        self.last_wheel_angles = None
 
-        # --- Subscribers: preserve the three original interfaces ---
+        # --- Subscribers: use stamped cumulative wheel feedback ---
         self.create_subscription(Imu, '/imu', self.cb_imu, 10)
-        self.create_subscription(Float32MultiArray, '/diff_rad', self.cb_calc_odom, 10)
+        self.create_subscription(JointState, '/joint_states', self.cb_calc_odom, 10)
         self.create_subscription(Empty, '/reset', self.cb_reset, 1)
 
         # --- Publisher and TF broadcaster ---
@@ -63,7 +65,8 @@ class AICAR_ODOM(Node):
         self.reset_stamp_ns = now.nanoseconds
         self._clear_imu()
         self.x = self.y = self.theta = 0.0
-        self.last_time = None
+        self.last_wheel_stamp_ns = None
+        self.last_wheel_angles = None
 
     def cb_imu(self, msg):
         """Store only the newest valid gyro Z rate and its measurement time."""
@@ -80,7 +83,7 @@ class AICAR_ODOM(Node):
             return
         # Do not integrate across an IMU outage that ended between wheel callbacks.
         if not self._imu_is_fresh(now):
-            self.last_time = None
+            self.last_wheel_angles = None
         self.imu_angular_velocity = msg.angular_velocity.z
         self.imu_stamp_ns = stamp
         self.imu_received_at = time.monotonic()
@@ -94,7 +97,8 @@ class AICAR_ODOM(Node):
         """Discard time baselines after a ROS clock rollback or simulation reset."""
         now = self.get_clock().now()
         if self.last_clock_ns is not None and now.nanoseconds < self.last_clock_ns:
-            self.last_time = None
+            self.last_wheel_stamp_ns = None
+            self.last_wheel_angles = None
             self.reset_stamp_ns = None
             self._clear_imu()
         self.last_clock_ns = now.nanoseconds
@@ -109,38 +113,64 @@ class AICAR_ODOM(Node):
                 0.0 <= receive_age <= IMU_TIMEOUT_SEC)
 
     def cb_calc_odom(self, msg):
-        """Integrate valid wheel increments and gyro rate into a planar pose."""
+        """Integrate stamped cumulative wheel angles and gyro rate into a planar pose."""
         now = self._observe_clock()
-        # Step 1: Require a fresh IMU sample and exactly two finite wheel increments.
-        if len(msg.data) != 2 or not all(isfinite(value) for value in msg.data):
-            self.last_time = None
-            self.get_logger().warning('Invalid wheel increments', throttle_duration_sec=1.0)
+        stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        # Step 1: Reject stale, future, duplicate and pre-reset wheel samples.
+        age = (now.nanoseconds - stamp) / 1e9
+        if (stamp <= 0 or not 0.0 <= age <= WHEEL_FEEDBACK_TIMEOUT_SEC or
+                (self.reset_stamp_ns is not None and stamp <= self.reset_stamp_ns) or
+                (self.last_wheel_stamp_ns is not None and stamp <= self.last_wheel_stamp_ns)):
+            self.get_logger().warning('Ignoring invalid or out-of-order wheel timestamp',
+                                      throttle_duration_sec=1.0)
             return
-        if not self._imu_is_fresh(now):
-            self.last_time = None
-            self.get_logger().warning('IMU unavailable or stale; odometry paused',
+        # Resolve the front wheel positions by name, not array order.
+        if len(msg.name) != len(msg.position) or len(set(msg.name)) != len(msg.name):
+            self.last_wheel_angles = None
+            self.get_logger().warning('Invalid JointState structure', throttle_duration_sec=1.0)
+            return
+        positions = dict(zip(msg.name, msg.position))
+        if not all(name in positions and isfinite(positions[name]) for name in WHEEL_NAMES[:2]):
+            self.last_wheel_angles = None
+            self.get_logger().warning('Missing or invalid wheel angles', throttle_duration_sec=1.0)
+            return
+        angles = tuple(positions[name] for name in WHEEL_NAMES[:2])
+
+        previous_stamp = self.last_wheel_stamp_ns
+        previous_angles = self.last_wheel_angles
+        self.last_wheel_stamp_ns = stamp
+        # The latest gyro rate is an approximation for this wheel interval.
+        # Require freshness at reception and bounded skew from the wheel stamp.
+        if (not self._imu_is_fresh(now) or
+                abs(stamp - self.imu_stamp_ns) / 1e9 > IMU_TIMEOUT_SEC):
+            self.last_wheel_angles = None
+            self.get_logger().warning('IMU unavailable, stale or misaligned; odometry paused',
                                       throttle_duration_sec=1.0)
             return
 
-        # Step 2: Retain the teacher's stationary-wheel bias suppression heuristic.
-        # It is not proof of body stationarity (slip or external motion is possible).
-        ang_vel = 0.0 if msg.data[0] == msg.data[1] == 0 else self.imu_angular_velocity
-
-        # Step 3: Establish a baseline and reject invalid or excessive time gaps.
-        # /diff_rad has no header, so this uses reception time, not acquisition time.
-        if self.last_time is None:
-            self.last_time = now
+        # Step 2: Establish a new baseline after startup, reset or an invalid gap.
+        # Cumulative positions let us recover short missing-message intervals.
+        self.last_wheel_angles = angles
+        if previous_stamp is None or previous_angles is None:
             return
-        dt = (now - self.last_time).nanoseconds / 1e9
+        # Step 3: Use the measurement timestamps, not callback arrival time.
+        dt = (stamp - previous_stamp) / 1e9
         if not 0.0 < dt <= MAX_ODOM_DT_SEC:
-            self.last_time = now if dt > 0 else None
             self.get_logger().warning('Invalid odometry interval; rebaselining',
                                       throttle_duration_sec=1.0)
             return
+        increments = tuple(current - previous for current, previous in zip(angles, previous_angles))
+        if not all(isfinite(value) for value in increments):
+            self.last_wheel_angles = None
+            return
+
+        # Retain the teacher's stationary-wheel bias suppression heuristic.
+        # It is not proof of body stationarity (slip or external motion is possible).
+        ang_vel = 0.0 if increments[0] == increments[1] == 0 else self.imu_angular_velocity
 
         # Step 4: Convert wheel angles to traveled distances (meters).
-        left_dist = WHEEL_RADIUS * msg.data[0]
-        right_dist = WHEEL_RADIUS * msg.data[1]
+        left_dist = WHEEL_RADIUS * increments[0]
+        right_dist = WHEEL_RADIUS * increments[1]
 
         # Step 5: The mean wheel distance approximates the body-center distance.
         distance = (left_dist + right_dist) / 2.0
@@ -166,7 +196,7 @@ class AICAR_ODOM(Node):
         self.odom.twist.twist.linear.x = lin_vel
         self.odom.twist.twist.angular.z = ang_vel
         # Use the same estimate timestamp for odometry and TF.
-        self.odom.header.stamp = now.to_msg()
+        self.odom.header.stamp = msg.header.stamp
         self.odom_pub.publish(self.odom)
 
         # Step 8: Broadcast TF (odom -> base_footprint) from the same estimate.
@@ -183,8 +213,7 @@ class AICAR_ODOM(Node):
         tf_msg.transform.rotation.w = self.odom.pose.pose.orientation.w
         self.broadcaster.sendTransform(tf_msg)
 
-        # Step 9: Retain the timestamp for the next integration interval.
-        self.last_time = now
+        # Step 9: The accepted wheel angles and stamp are the next baseline.
 
 
 def main(args=None):

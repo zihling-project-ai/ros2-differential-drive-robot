@@ -5,8 +5,7 @@ from unittest.mock import Mock, patch
 
 import rclpy
 from rclpy.time import Time
-from sensor_msgs.msg import Imu
-from std_msgs.msg import Float32MultiArray
+from sensor_msgs.msg import Imu, JointState
 
 from ai_car import aicar_odom
 
@@ -20,12 +19,16 @@ def main():
         imu = Imu()
         imu.header.frame_id = 'imu_link'
         imu.angular_velocity.z = 2.0
-        wheel = Float32MultiArray(data=[0.5, 1.5])
+        wheel = JointState()
+        wheel.name = list(aicar_odom.WHEEL_NAMES[:2])
         with patch.object(node, 'get_clock', return_value=clock), \
                 patch.object(node.broadcaster, 'sendTransform', wraps=node.broadcaster.sendTransform) as tf:
-            for ns in (10_000_000_000, 10_050_000_000):
+            for ns, angles in ((10_000_000_000, [0.0, 0.0]),
+                               (10_050_000_000, [0.5, 1.5])):
                 clock.now.return_value = Time(nanoseconds=ns)
                 imu.header.stamp = clock.now.return_value.to_msg()
+                wheel.header.stamp = imu.header.stamp
+                wheel.position = angles
                 node.cb_imu(imu)
                 node.cb_calc_odom(wheel)
             tf.assert_called_once()

@@ -75,7 +75,7 @@ with patch.dict(sys.modules, {
     'rclpy.node': fake_module('rclpy.node', Node=FakeNode),
     'nav_msgs': fake_module('nav_msgs'), 'nav_msgs.msg': fake_module('nav_msgs.msg', Odometry=odometry),
     'std_msgs': fake_module('std_msgs'), 'std_msgs.msg': fake_module('std_msgs.msg', Empty=NS, Float32MultiArray=NS),
-    'sensor_msgs': fake_module('sensor_msgs'), 'sensor_msgs.msg': fake_module('sensor_msgs.msg', Imu=NS),
+    'sensor_msgs': fake_module('sensor_msgs'), 'sensor_msgs.msg': fake_module('sensor_msgs.msg', Imu=NS, JointState=NS),
     'geometry_msgs': fake_module('geometry_msgs'), 'geometry_msgs.msg': fake_module('geometry_msgs.msg', TransformStamped=transform),
     'tf2_ros': fake_module('tf2_ros', TransformBroadcaster=Mock(side_effect=lambda node: Mock())),
 }):
@@ -87,6 +87,7 @@ class TestOdom(unittest.TestCase):
         self.node = aicar_odom.AICAR_ODOM()
         self.now_ns = 10_000_000_000
         self.receive_time = 10.0
+        self.positions = [0.0, 0.0]
         self.node.clock.now.side_effect = lambda: FakeTime(self.now_ns)
         patcher = patch.object(aicar_odom.time, 'monotonic', side_effect=lambda: self.receive_time)
         patcher.start()
@@ -101,8 +102,16 @@ class TestOdom(unittest.TestCase):
         self.node.cb_imu(NS(header=NS(stamp=stamp, frame_id=frame), angular_velocity=NS(z=rate),
                             angular_velocity_covariance=[covariance] + [0.0]*8))
 
-    def wheel(self, left=0.0, right=0.0):
-        self.node.cb_calc_odom(NS(data=[left, right]))
+    def wheel_position(self, left, right, age=0.0, names=None):
+        stamp = FakeTime(self.now_ns - round(age * 1e9)).to_msg()
+        names = list(aicar_odom.WHEEL_NAMES[:2]) if names is None else names
+        self.node.cb_calc_odom(NS(header=NS(stamp=stamp), name=names, position=[left, right]))
+
+    def wheel(self, left=0.0, right=0.0, age=0.0):
+        # Test helper accepts increments, but the ROS message contains cumulative values.
+        self.positions[0] += left
+        self.positions[1] += right
+        self.wheel_position(*self.positions, age=age)
 
     def baseline(self):
         self.imu()
@@ -111,6 +120,7 @@ class TestOdom(unittest.TestCase):
 
     def test_first_sample_only_establishes_baseline(self):
         self.wheel(1.0, 1.0)
+        self.advance(0.01)
         self.imu()
         self.wheel(1.0, 1.0)
         self.assertEqual((self.node.x, self.node.y, self.node.theta), (0, 0, 0))
@@ -173,8 +183,9 @@ class TestOdom(unittest.TestCase):
         self.baseline()
         self.advance(0.12)
         self.wheel(1.0, 1.0)
-        self.assertIsNone(self.node.last_time)
+        self.assertIsNone(self.node.last_wheel_angles)
         self.node.publisher.publish.assert_not_called()
+        self.advance(0.01)
         self.imu(1.0)
         self.wheel(1.0, 1.0)
         self.advance(0.05)
@@ -185,8 +196,9 @@ class TestOdom(unittest.TestCase):
     def test_receive_timeout_even_if_ros_clock_paused(self):
         self.baseline()
         self.receive_time += 0.11
+        self.now_ns += 1_000_000  # A new measurement stamp, but old IMU receipt time.
         self.wheel(1.0, 1.0)
-        self.assertIsNone(self.node.last_time)
+        self.assertIsNone(self.node.last_wheel_angles)
         self.node.publisher.publish.assert_not_called()
 
     def test_imu_outage_between_wheel_callbacks(self):
@@ -200,9 +212,11 @@ class TestOdom(unittest.TestCase):
         self.baseline()
         self.advance(0.02)
         self.imu()
+        names = list(aicar_odom.WHEEL_NAMES[:2])
         for data in ([], [1], [1, 2, 3], [math.nan, 0]):
-            self.node.cb_calc_odom(NS(data=data))
-        self.assertIsNone(self.node.last_time)
+            self.node.cb_calc_odom(NS(header=NS(stamp=FakeTime(self.now_ns).to_msg()),
+                                     name=names, position=data))
+        self.assertIsNone(self.node.last_wheel_angles)
         self.wheel()
         for _ in range(5):
             self.advance(0.05)
@@ -223,6 +237,95 @@ class TestOdom(unittest.TestCase):
         self.imu()
         self.wheel()
         self.assertEqual(self.node.publisher.publish.call_count, 1)
+
+    def test_measurement_timestamps_not_arrival_times(self):
+        self.imu(age=0.01)
+        self.wheel(age=0.01)
+        self.advance(0.08)
+        self.imu(1.0, age=0.04)
+        self.wheel(1.0, 1.0, age=0.04)
+        # Actual wheel interval is 0.05 s even though arrival interval is 0.08 s.
+        self.assertAlmostEqual(self.node.odom.twist.twist.linear.x, 0.033 / 0.05)
+        self.assertAlmostEqual(self.node.theta, 0.05)
+        self.assertEqual(self.node.odom.header.stamp, FakeTime(self.now_ns - 40_000_000).to_msg())
+
+    def test_short_missing_wheel_message_recovers_cumulative_distance(self):
+        self.baseline()
+        self.advance(0.04)
+        self.imu()
+        # No wheel callback for this interval; the next sample spans both.
+        self.advance(0.04)
+        self.imu()
+        self.wheel(2.0, 2.0)
+        self.assertAlmostEqual(self.node.x, 0.066)
+        self.assertAlmostEqual(self.node.odom.twist.twist.linear.x, 0.066 / 0.08)
+
+    def test_duplicate_and_out_of_order_wheel_samples_do_not_replace_baseline(self):
+        self.baseline()
+        self.advance(0.05)
+        self.imu()
+        self.wheel_position(1.0, 1.0)
+        self.wheel_position(100.0, 100.0)  # Duplicate timestamp.
+        self.wheel_position(100.0, 100.0, age=0.01)  # Out of order.
+        self.advance(0.05)
+        self.imu()
+        self.wheel_position(2.0, 2.0)
+        self.assertAlmostEqual(self.node.x, 0.066)
+        self.assertEqual(self.node.publisher.publish.call_count, 2)
+
+    def test_wheel_names_not_array_order(self):
+        self.baseline()
+        self.advance(0.05)
+        self.imu(2.0)
+        self.wheel_position(1.5, 0.5, names=list(reversed(aicar_odom.WHEEL_NAMES[:2])))
+        self.assertAlmostEqual(self.node.x, 0.033 * math.cos(0.05))
+
+    def test_reset_rejects_queued_wheel_and_preserves_continuous_angles(self):
+        self.imu()
+        self.wheel_position(10.0, 10.0)
+        self.advance(0.05)
+        self.imu()
+        self.wheel_position(11.0, 11.0)
+        self.node.cb_reset(NS())
+        self.advance(0.01)
+        self.imu()
+        self.wheel_position(11.0, 11.0, age=0.02)  # Queued pre-reset feedback.
+        self.assertIsNone(self.node.last_wheel_angles)
+        self.wheel_position(11.0, 11.0)  # Odom reset before Base's timer.
+        self.advance(0.05)
+        self.imu()
+        self.wheel_position(11.0, 11.0)  # Base rebaselines but keeps cumulative angles.
+        self.assertEqual((self.node.x, self.node.y, self.node.theta), (0, 0, 0))
+        self.advance(0.05)
+        self.imu()
+        self.wheel_position(12.0, 12.0)
+        self.assertAlmostEqual(self.node.x, 0.033)
+
+    def test_base_reset_feedback_before_odom_reset(self):
+        self.imu()
+        self.wheel_position(10.0, 10.0)
+        self.advance(0.05)
+        self.imu()
+        self.wheel_position(10.0, 10.0)  # Base has reset its raw tick baseline.
+        self.node.cb_reset(NS())
+        self.advance(0.05)
+        self.imu()
+        self.wheel_position(10.0, 10.0)
+        self.advance(0.05)
+        self.imu()
+        self.wheel_position(11.0, 11.0)
+        self.assertAlmostEqual(self.node.x, 0.033)
+
+    def test_future_old_and_misaligned_wheel_samples_are_not_integrated(self):
+        self.baseline()
+        self.advance(0.15)
+        self.imu()
+        self.wheel_position(20.0, 20.0, age=-0.01)
+        self.wheel_position(20.0, 20.0, age=0.3)
+        # Valid wheel stamp but too far from latest IMU time.
+        self.wheel_position(1.0, 1.0, age=0.11)
+        self.node.publisher.publish.assert_not_called()
+        self.assertIsNone(self.node.last_wheel_angles)
 
     def test_ros_clock_rollback_restarts_baseline(self):
         self.baseline()

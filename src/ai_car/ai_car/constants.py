@@ -15,5 +15,7 @@ HOME_POS = (0, 0)
 HOME_TOOL = 0
 
 # Shared identifiers must match the existing robot description.
+WHEEL_NAMES = ('wheel_left_joint', 'wheel_right_joint',
+               'wheel_rear_left_joint', 'wheel_rear_right_joint')
 ARM_NAMES = ('arm_joint_1', 'arm_joint_2', 'tool_joint')
 IMU_FRAME_ID = 'imu_link'

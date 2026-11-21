@@ -22,7 +22,7 @@ from ai_car.dxl_wheel import Wheel_Controller, VELOCITY_COMMAND_LIMIT, XM_TICK2R
 # Shared robot geometry and interface constants
 from ai_car.constants import (
     ARM_NAMES, JOINT_MIN_DEG, JOINT_MAX_DEG, TOOL_MIN_DEG, TOOL_MAX_DEG,
-    WHEEL_RADIUS, WHEEL_SEPARATION,
+    WHEEL_NAMES, WHEEL_RADIUS, WHEEL_SEPARATION,
 )
 
 # --- Original hardware transport and conversion parameters ---
@@ -155,10 +155,7 @@ class AICAR_BASE(Node):
             # Keep the names and ordering consistent with the URDF and driver feedback.
             self.joint_states = JointState()
             self.joint_states.name = [
-                'wheel_left_joint',
-                'wheel_right_joint',
-                'wheel_rear_left_joint',
-                'wheel_rear_right_joint',
+                *WHEEL_NAMES,
                 *ARM_NAMES,
             ]
 
@@ -288,7 +285,9 @@ class AICAR_BASE(Node):
                 self.wheel.reset()
                 self.last_wheel_ticks = None
                 self.diff_wheel_rad = [0.0] * 4
-                self.total_wheel_rad = [0.0] * 4
+                # Keep cumulative JointState continuous across a shared reset.
+                # Odometry owns its pose origin; resetting both independently
+                # could otherwise create a false displacement between callbacks.
                 self.reset_received = False
                 if self.torque_data == 1:
                     self.torque_received = False
@@ -359,7 +358,8 @@ class AICAR_BASE(Node):
             self.joint_states_pub.publish(self.joint_states)
 
             # 8. Publish the existing front-left/right angular-increment contract.
-            # Preserve the current odometry interface until the odom review.
+            # Retain the original teaching topic for compatibility; odometry
+            # uses the stamped cumulative wheel positions in JointState.
             diff_msg = Float32MultiArray()
             diff_msg.data = self.diff_wheel_rad[:2]
             self.diff_rad_pub.publish(diff_msg)

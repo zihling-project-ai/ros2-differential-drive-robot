@@ -28,6 +28,9 @@ class TestSharedConstants(unittest.TestCase):
         links = {link.attrib['name'] for link in root.findall('link')}
         self.assertEqual(constants.ARM_NAMES, ('arm_joint_1', 'arm_joint_2', 'tool_joint'))
         self.assertTrue(set(constants.ARM_NAMES) <= joints)
+        self.assertEqual(constants.WHEEL_NAMES, ('wheel_left_joint', 'wheel_right_joint',
+                                                 'wheel_rear_left_joint', 'wheel_rear_right_joint'))
+        self.assertTrue(set(constants.WHEEL_NAMES) <= joints)
         self.assertEqual(constants.IMU_FRAME_ID, 'imu_link')
         self.assertIn(constants.IMU_FRAME_ID, links)
 

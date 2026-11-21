@@ -150,7 +150,7 @@ Timer 觸發
 | `__init__()` | 共用一個 Port；驗證連線、建立 Topic 與 Timer，部分初始化失敗時清理資源 |
 | `cb_reset()`、Torque、Tool、Joint、Twist callbacks | 將有效要求暫存，與 Timer 的硬體 I/O 分離；不把資料 Reset 等同於回原位 |
 | `cb_timer()` | 停止優先、命令逾時、處理有效目標、讀取和發布回饋；故障時鎖定而非自動重啟 |
-| `fn_update_states()` | 建立首次 Encoder 基準、保留低速增量並驗證所有回饋；暫保留前兩輪 `/diff_rad` 契約 |
+| `fn_update_states()` | 建立 Encoder 基準、保留低速增量並驗證所有回饋；發布帶時間戳的累計角度，保留前兩輪 `/diff_rad` 教學介面 |
 | `fn_shutdown()`、`main()` | 停止請求與資源清理分開，不依賴等待時間或自動手臂移動證明安全 |
 
 英文註解保留原教學步驟並補上設計原因。36 項假硬體離線測試已通過；ROS2 容器驗收與實車測試仍需分別追蹤。
@@ -165,7 +165,7 @@ MPU9250 (I²C, bus 1, address 0x68)
   ↓ 合併 16-bit 並解碼二補數
   ↓ 除以 131 LSB/(°/s)，轉為 °/s，再轉為 rad/s
   ↓ 加上時間戳、imu_link 與量測有效性資訊
-/imu → aicar_odom.py（結合 /diff_rad）→ /odom、TF
+/imu → aicar_odom.py（結合 /joint_states 的累計輪角與時間戳）→ /odom、TF
 ```
 
 | 函式 | 責任 |
@@ -202,7 +202,7 @@ MPU9250 (I²C, bus 1, address 0x68)
 
 ### `aicar_odom.py`：運動學、數值積分與 TF
 
-**模組目標：** 不直接操作硬體；使用 `/diff_rad`（左、右前輪本次角度增量）及 `/imu`（Z 軸角速度）持續估算二維位姿 `(x, y, theta)` 和速度，發布 `/odom` 並廣播同一次估算的 `odom → base_footprint`。由車輪訊息觸發運算，目標更新率取決於 Base（30 Hz），不是 IMU（200 Hz）。
+**模組目標：** 不直接操作硬體；使用 `/joint_states`（依名稱讀取左、右前輪累計角度及 header 時間戳）及 `/imu`（Z 軸角速度）持續估算二維位姿 `(x, y, theta)` 和速度，發布 `/odom` 並廣播同一次估算的 `odom → base_footprint`。由車輪訊息觸發運算，目標更新率取決於 Base（30 Hz），不是 IMU（200 Hz）。Base 仍發布原有 `/diff_rad` 供教學對照，Odometry 不再訂閱它。
 
 | 函式 | 責任與設計理由 |
 | --- | --- |
@@ -227,9 +227,9 @@ MPU9250 (I²C, bus 1, address 0x68)
 
 `/odom` 與 `/tf` 使用相同位姿與時間戳，前者供導航讀取狀態，後者供 RViz2、LiDAR、SLAM 將不同來源的資料轉換至共同座標系。`map → odom` 由定位或 SLAM 提供；不得由 Odometry 重複廣播定位變換。同一 TF 邊應有單一發布責任。`odom` 正常運作應連續，長期漂移由定位修正，而非週期性 Reset。
 
-**時間與 Reset 的設計取捨：** IMU 同時檢查 ROS header 時間及單調接收時間（暫定 0.1 s）；輪回饋間隔上限暫定 0.2 s，異常時不發布新的估算，恢復時重建基準而非補積分中斷時間。無效或缺失區間的位移不能被還原，暫停估算也不是停止實車。共享 `/reset` 無跨 Node 同步確認；丟棄 Reset 前 IMU 時戳，仍無法分辨未帶 header 的舊 `/diff_rad`，只能在停止且隔離的測試流程驗證。今後用具量測時戳、序列或累計值的車輪介面才能完整驗證遺失、延遲及基準切換；跨主機需同步時鐘。Covariance 目前未校正，預設零不代表已知零誤差，不能直接當成可信融合量測。
+**時間與 Reset 的設計取捨：** IMU 同時檢查 ROS header 時間及單調接收時間（暫定 0.1 s），且與輪回饋時間差須在同一門檻內；輪回饋新鮮度及輪回饋間隔上限皆暫定 0.2 s。使用 `JointState.header.stamp` 的時間差而非接收時間，`/odom`、TF 共用該時間戳；前後累計角度之差可在短暫遺失訊息且資料仍有效時保留輪距離增量。超過時間上限、無效或 IMU 中斷的區間不補積分，恢復時重建基準。Base 的時間戳為該批硬體讀取完成後的主機時間，不是四個 Encoder 獨立的硬體時間；最新 IMU 角速度仍是區間近似，跨主機需同步時鐘。暫停估算不是停止實車。共享 `/reset` 不具跨 Node 原子同步；Base 停輪並重建 raw tick 基準，但保留累計角度，Odometry 清除位姿及差分基準、拒絕 Reset 前的 IMU 與 JointState 時戳，避免兩個 Node 處理順序不同造成假的反向位移。仍應在已停止的測試流程執行 Reset；Base 程序重新啟動會重新建立累計值，須協調重新啟動 Odometry 或重新歸零，不能假設所有中斷均可自動識別。`/joint_states` 必須只有可信的實車回饋來源，不得混入展示 GUI。Covariance 目前未校正，預設零不代表已知零誤差，不能直接當成可信融合量測。
 
-**驗收狀態（草稿 PR #6）：** 保留原有 Topic、幾何參數、Quaternion 與 TF 邏輯。新增 12 項合成資料離線測試（共 58 項通過），包括直行、倒退、原地旋轉、Midpoint、資料過期、回時、Reset、Quaternion/TF 一致性及初始化清理；ROS2 Odometry/TF smoke test 已加入 CI。實車頻率、時間閾值、漂移、輪徑／輪距、covariance 及導航整合尚待驗收；不因通過測試而宣稱完成定位或安全驗證。
+**驗收狀態（草稿 PR #6）：** 保留 `/diff_rad`、原始幾何參數、Quaternion 與 TF 邏輯；Odometry 改用 `/joint_states`。原有 12 項測試改為累計角度資料，新增 7 項測試：量測時間與接收時間差、短期遺失、重複及亂序、依名索引、兩種 Reset 處理順序、過期／未對齊資料；Base 原有 Reset 測試同時驗證累計角度連續與 `/diff_rad` 歸零。共 79 項離線測試通過，ROS2 Odometry/TF smoke test 隨介面更新。實車頻率、時間閾值、漂移、輪徑／輪距、covariance 及導航整合尚待驗收；不因通過測試而宣稱完成定位或安全驗證。
 
 ### `aicar_teleop.py`：操作目標、回饋及命令有效性
 

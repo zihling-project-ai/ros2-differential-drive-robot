@@ -189,15 +189,26 @@ class TestBase(unittest.TestCase):
         node = self.make_base()
         self.enable_wheels(node)
         self.enable_arm(node)
+        self.wheel.get_wheel.return_value = [10, 10, 10, 10]
+        node.cb_timer()
+        previous_total = list(node.total_wheel_rad)
+        self.assertGreater(previous_total[0], 0.0)
         node.cb_cmd(twist(0.03))
         node.cb_joint(SimpleNamespace(data=[10, 20]))
         node.cb_reset(SimpleNamespace())
+        self.wheel.get_wheel.return_value = [0, 0, 0, 0]
         node.cb_timer()
         self.wheel.reset.assert_called_once()
         self.wheel.set_wheel.assert_not_called()
         self.arm.set_joint.assert_not_called()
         self.arm.reset.assert_not_called()
-        self.assertEqual(node.total_wheel_rad, [0.0] * 4)
+        self.assertEqual(node.total_wheel_rad, previous_total)
+        self.assertEqual(node.diff_rad_pub.publish.call_args.args[0].data, [0.0, 0.0])
+        self.assertEqual(node.joint_states.position[:4], previous_total)
+        self.wheel.get_wheel.return_value = [1, 1, 1, 1]
+        node.cb_timer()
+        self.assertEqual(node.total_wheel_rad, [value + aicar_base.XM_TICK2RAD
+                                               for value in previous_total])
 
     def test_disable_request_cannot_be_overwritten_by_enable(self):
         node = self.make_base()
