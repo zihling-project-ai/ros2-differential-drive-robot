@@ -37,7 +37,7 @@ jobs:
           print(f'Parsed {len(sources)} Python files, package.xml, and URDF XML')
           PY
 
-      - name: Run offline arm driver unit tests
+      - name: Run offline driver unit tests
         run: PYTHONPATH=src/ai_car python3 -m unittest discover -s src/ai_car/test -p 'test_*.py' -v
 
   ros2-build:
@@ -63,6 +63,10 @@ jobs:
               colcon build --packages-select ai_car
               source install/setup.bash
               ros2 pkg prefix ai_car
+              python3 src/ai_car/test/ros_base_smoke.py
+              python3 src/ai_car/test/ros_imu_smoke.py
+              python3 src/ai_car/test/ros_odom_smoke.py
+              python3 src/ai_car/test/ros_teleop_smoke.py
             '
 
       # No hardware access, robot launch, motor commands, or deployment in CI.
