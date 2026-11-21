@@ -13,6 +13,8 @@
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>tf2_ros</depend>
+  <!-- Hardware communication dependencies -->
+  <exec_depend>dynamixel_sdk</exec_depend>
   <exec_depend>python3-smbus</exec_depend>
 
   <export>
