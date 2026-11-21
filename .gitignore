@@ -8,3 +8,15 @@ __pycache__/
 .env
 .env.*
 .vscode/browse.vc.db*
+
+# Local-only credentials and operating-system metadata
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+id_ecdsa
+credentials.local.*
+secrets.local.*
+.DS_Store
