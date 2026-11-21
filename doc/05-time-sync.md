@@ -1,253 +1,141 @@
-# 05 — Chrony、NTP 與 ROS 2 跨主機時間同步
+# 05 — 分散式時間基準與 Chrony 同步驗收
 
-> **狀態：** 2026-11-20 方案 A 已實測 PASS；車端使用 Chrony Client 向 WSL2 `192.168.123.2:1123/UDP` 校時。  
-> **重要：** 在大幅調整 Raspberry Pi 系統時間前，須停止依賴時間戳的 ROS 2、TF、Odometry、SLAM 與實體控制程序。
+> **工程目標：** 建立開發端與車端之間可驗證的時間基準，使 ROS2 感測回饋、時間戳及跨主機資料可正確比較。
+>
+> **驗證基準：** 2026-11-20 的有線診斷方案（03 的方案 B）已完成 Chrony 同步及後續 Zenoh Topic 復驗；無線方案的時間來源與同步仍待驗證。
 
-## 5.1 故障背景
+## 5.1 為什麼時間同步是機器人的必要條件？
 
-初次 ROS 2 Topic 雙主機測試時：
+| 時間概念 | AICAR 中的責任 |
+| --- | --- |
+| 系統／ROS 時間 | 為 `JointState`、IMU、Odometry、TF 記錄量測或估算時間；跨主機使用相容時鐘基準 |
+| 單調時間（monotonic） | 判斷本機經過時間、控制命令及回饋逾時，不受系統時鐘跳變直接影響 |
+| 量測時間與接收時間 | 量測時間用於計算運動積分間隔；接收時間輔助判斷通訊中斷 |
 
-- WSL2：2026-11-20；可上學校網路。
-- car06：2026-10-28；只有 `192.168.123.0/24` 本地路由，沒有 Default Gateway、無 Internet；`systemd-timesyncd` 為 active 但不同步。
-- Zenoh：顯示 `incoming timestamp ... exceeding delta 500ms is rejected`，儘管 String Topic 仍能到達。
+新版 AICAR 使用 `JointState.header.stamp` 的時間差估算輪角與線速度；IMU 也提供量測時間，並驗證資料新鮮度。因此跨主機時間不一致可能使有效資料被判為過期，或造成積分誤差及 TF 查詢問題。同步系統時鐘不代表網路沒有延遲，也不替代獨立的命令逾時機制。
 
-車端檢查：
+模擬時間由模擬環境的 `/clock` 管理，不能直接與實車系統時間混用；本篇只處理實體主機時間基準。大幅校時可能使時間戳突然跳變，應先確保車體停止、硬體處於安全狀態，再停止依賴實體時間的控制、感測及定位程序，完成同步後重新建立其時間基準。
 
-```bash
-ip -4 route
-date -Is
-timedatectl status
-# 變更時間服務前曾使用
-# timedatectl timesync-status
-```
+## 5.2 故障證據與原因判斷
 
-實測 `ip -4 route` 只有 `192.168.123.0/24 dev br0`，Ping 公網回傳 `Network is unreachable`。車端沒有可用 RTC（`RTC time: n/a`），無法假設斷電再開機後時鐘仍正確。
+| 既有觀測（2026-11-20） | 工程判斷 |
+| --- | --- |
+| 開發端日期為 2026-11-20，車端日期為 2026-10-28 | 車端時鐘相差約 23 天，不能直接比較跨主機 timestamp |
+| 車端只有有線專用子網路由，無 default gateway／Internet | 無法依賴外部 NTP；需另規劃可達的本地時間來源 |
+| `systemd-timesyncd` active，但系統未同步 | 服務啟動不等於已選用有效來源 |
+| 車端顯示 `RTC time: n/a` | 當時無可用 RTC 資訊，不能假設斷電再啟動後時鐘正確 |
+| Zenoh 出現 timestamp 超過 500 ms 而遭拒絕的警告，仍有 String Topic 到達 | 通訊可達不代表資料時間正確；500 ms 是該次版本／配置的觀察門檻 |
 
-## 5.2 方案：WSL2 提供本地 NTP，Pi 作為 Client
+可使用 `date -Is`、`timedatectl status` 及 `ip -4 route` 分辨時鐘與網路狀態。上述證據不應解讀為 ROS2 或 Zenoh 本身損壞。
+
+## 5.3 時間來源架構：可達性優先
 
 ```text
-WSL2 Ubuntu 24.04
-  192.168.123.2:1123 UDP ── Windows/Hyper-V Firewall ──► Pi car06
-  Chrony Server                                      192.168.123.1
-                                                     Chrony Client
+Windows / WSL2（dev-host）             Raspberry Pi（robot-host）
+可用時間來源 → Chrony NTP Server   ◄── NTP / UDP ──  Chrony Client
+                      IP1:1123                         IP2
+                         └──── 有線診斷（已驗證） ─────┘
 ```
 
-Windows 上 W32Time 已在 UDP 123 監聽，且當時 `w32tm /query /status` 顯示 `Local CMOS Clock`、未同步。WSL2 Chrony 嘗試綁定 `192.168.123.2:123` 時回報 `Could not open NTP socket`。本輪避免停用 Windows W32Time，改以 WSL2 **UDP 1123** 提供 NTP。
+沿用 [01](01-os-hosts.md)、[03](03-network-ssh.md) 的代稱。當車端僅有直連網段又無 Internet 時，由可達的 WSL2 提供本地 NTP；無線恢復後應依獲准網路重新選擇可達且可信的時間來源，可以是可達的本地端點或核准的 NTP 服務，不必強制讓 NTP 與 Zenoh Router 同機。
 
-**精度注意：** WSL2 裡 Chrony 因容器偵測以 `chronyd -x` 執行，不負責直接調整 WSL 系統時鐘。`chronyc tracking` 很小的修正量只描述與其選定來源的關係，不是 UTC 絕對精度保證。本輪另用四時間戳 NTP 查詢，驗證 NTP Server 與 WSL2 系統時鐘相對差約 `+0.433 ms`（單次量測）。若嚴格要求 UTC 精度，還需獨立驗證 Windows/Hypervisor 時間來源。
+### UDP 123 與 1123 的取捨
 
-## 5.3 WSL2 安裝與設定 Chrony Server
+NTP 通常使用 UDP 123。既有 Windows 的 W32Time 已監聽 UDP 123；WSL2 Chrony 嘗試綁定專用位址的 123 埠時出現 `Could not open NTP socket`。本輪因此不停止 Windows 時間服務，改用 WSL2 UDP 1123 作為該拓撲的 NTP 端點。
 
-**WSL2**（需要管理權限、學校政策允許）：
+| 端點 | 用途與限制 |
+| --- | --- |
+| `IP1:1123/UDP` | 本次有線 NTP Server，車端 Client 需明確指定非預設埠 |
+| `IP3` 或其他獲准來源 | 無線方案的候選時間來源，尚未驗證，不直接照搬有線端點 |
 
-```bash
-sudo apt update
-sudo apt install -y chrony
+此為當時的環境設計決策，UDP 1123 不是 ROS2 或 Chrony 的通用必要條件。
 
-sudo mkdir -p /etc/chrony/conf.d
-sudo tee /etc/chrony/conf.d/aicar-ntp.conf >/dev/null <<'EOF_CONFIG'
-allow 192.168.123.1/32
-allow 192.168.123.2/32
-bindaddress 192.168.123.2
+### WSL2 Chrony `-x` 模式
+
+本輪 WSL2 的 `chronyd` 以 `-x` 運作，不直接校正 WSL2 系統時鐘；Chrony 仍能追蹤時間來源並維護提供給 NTP Client 的軟體時鐘。Windows 當時亦記錄 W32Time 來源為 Local CMOS Clock，未獨立證明 UTC 同步。
+
+因此必須分辨三個對象：Windows／WSL2 系統時鐘、Chrony 提供的 NTP 時鐘、Pi 系統時鐘。歷史四時間戳 NTP 查詢顯示 WSL2 系統時鐘與其 NTP Server 的估算相對差約 `+0.433 ms`（單次量測），不是 Pi 與 WSL2 的長期誤差或 UTC 精度保證。若需要更嚴格精度，必須獨立驗證系統時間來源及網路延遲。
+
+Chrony 官方說明：[chronyd `-x`](https://chrony-project.org/doc/4.5/chronyd.html)、[chronyc tracking](https://chrony-project.org/doc/4.5/chronyc.html#tracking)。
+
+## 5.4 有線時間服務配置參考
+
+下列為本輪設計的精簡配置模板，`IP1`、`IP2` 必須在獲准的實際測試網路替換為有效位址；不要直接覆寫既有 Chrony 設定。調整系統服務須在實車停止及管理授權的前提下進行。
+
+```text
+# WSL2 Chrony Server configuration (template)
+bindaddress IP1
 port 1123
-EOF_CONFIG
-
-sudo systemctl restart chrony
-systemctl is-active chrony
-sudo ss -lunp | grep ':1123'
-sudo chronyc accheck 192.168.123.1
+allow IP2/32
 ```
-
-其中對 `192.168.123.2/32` 的 `allow` 是提供 WSL2 **本機測試**使用；生產環境可按需要縮小。成功時應見：
 
 ```text
-active
-192.168.123.2:1123  ... chronyd
-208 Access allowed
+# Raspberry Pi Chrony Client configuration (template)
+server IP1 port 1123 iburst
 ```
 
-`chronyc accheck` 需要具備存取 Chrony 命令 Socket 的權限；一般使用者曾回報 `501 Not authorised`，改用 `sudo chronyc accheck ...` 後才取得正確的 ACL 判定。
+原測試以 `conf.d` 個別設定，車端預先存在 `makestep` 策略，無須重複加入；勿為了消除警告而強制移除 WSL2 的 `-x` 或在機器運動中手動調時。
 
-### WSL2 服務檢查
+Hyper-V Firewall 沿用 [04](04-zenoh-firewall.md) 的最小權限原則：本次有線測試僅針對獲准車端來源與專用開發端介面的 UDP 1123 配置入站規則。當時規則為 `Enabled=True`、`Action=Allow`、`EnforcementStatus=OK`；不關閉整個防火牆。重新連線或重灌後須核對規則與實際端點，不假設車端重灌會移除 Windows 規則。
 
-```bash
-chronyc tracking
-chronyc sources -v
-sudo journalctl -u chrony -n 50 --no-pager
-ps -ef | grep '[c]hronyd'
-```
+## 5.5 車端離線安裝：可重現的跨架構依賴驗證
 
-如果日誌出現 `chronyd ... -x`、`Could not step system clock`，不要直接移除 `-x` 強制調時；先核對宿主系統時鐘與 NTP 來源。
+原有車端為 Ubuntu 24.04 ARM64，且當時無 Internet。先由目標車端 APT 索引、架構及模擬安裝確認需要的套件，再於可上網環境取得對應 `.deb` 及可信索引中的 SHA256 校驗資訊；不得把 AMD64 套件直接複製至 ARM64。
 
-## 5.4 Windows Hyper-V Firewall 開放 UDP 1123
+| 套件 | 歷史快照版本 | 架構 | 當時動作 |
+| --- | --- | --- | --- |
+| `chrony` | `4.5-1ubuntu4.2` | arm64 | 新裝 |
+| `tzdata` | `2026e-0ubuntu0.24.04.1` | all | 升級 |
+| `tzdata-legacy` | `2026e-0ubuntu0.24.04.1` | all | 新裝 |
+| `systemd-timesyncd` | 當時版本 | — | APT 依相依性調整，由 Chrony 接手 |
 
-**Windows PowerShell（管理員權限，需獲允許）：**
-
-```powershell
-$wsl = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
-
-New-NetFirewallHyperVRule `
-  -Name 'AICAR-NTP-1123' `
-  -DisplayName 'AICAR Chrony NTP UDP 1123' `
-  -Direction Inbound `
-  -VMCreatorId $wsl `
-  -Protocol UDP `
-  -LocalAddresses '192.168.123.2' `
-  -LocalPorts 1123 `
-  -RemoteAddresses '192.168.123.1' `
-  -Action Allow
-
-Get-NetFirewallHyperVRule -Name 'AICAR-NTP-1123'
-```
-
-本輪 `Enabled=True`、`Action=Allow`、`EnforcementStatus=OK`。不要為此關閉整個 Hyper-V Firewall。規則保存在 Windows，**重灌 Raspberry Pi 不會移除它**。
-
-## 5.5 車端先驗證 NTP 封包，不更動時鐘
-
-車端可用 Python 標準函式庫測試 UDP 1123：
-
-```bash
-python3 - <<'PY'
-import socket
-import struct
-from datetime import datetime, timezone
-
-request = b'\x23' + b'\x00' * 47
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-    sock.settimeout(5)
-    sock.sendto(request, ('192.168.123.2', 1123))
-    data, address = sock.recvfrom(512)
-
-assert len(data) >= 48, 'short NTP response'
-leap = data[0] >> 6
-stratum = data[1]
-seconds, fraction = struct.unpack('!II', data[40:48])
-unix_time = seconds - 2208988800 + fraction / (2**32)
-print('NTP Server:', address)
-print('Leap Indicator:', leap)
-print('Stratum:', stratum)
-print('Server UTC:', datetime.fromtimestamp(unix_time, timezone.utc).isoformat())
-PY
-```
-
-本輪得到 `Leap Indicator: 0`、`Stratum: 3`、有效 UTC 時間。**收到封包不代表車端系統時鐘已經被校正。**
-
-## 5.6 Raspberry Pi Chrony 離線安裝（本輪已實際完成）
-
-車端 Ubuntu 24.04 ARM64 無 Internet；先在車端執行套件查核／模擬：
+以上僅為當時快照，不應在新設備固定下載相同版本。重建流程的工程關鍵是：確認架構與相依 → 取得可信套件及驗證資訊 → SHA256 檢查 → 模擬安裝 → 確認服務切換與安全狀態後安裝。可用以下指令進行必要檢查：
 
 ```bash
 dpkg --print-architecture
 apt-cache policy chrony
-sudo apt-get -s install chrony
-```
-
-本輪需要：
-
-| Package | 版本（當次快照） | 架構 | 安裝動作 |
-|---|---|---|---|
-| chrony | `4.5-1ubuntu4.2` | arm64 | 新裝 |
-| tzdata | `2026e-0ubuntu0.24.04.1` | all | 升級 |
-| tzdata-legacy | `2026e-0ubuntu0.24.04.1` | all | 新裝 |
-| systemd-timesyncd | 原版本 | — | 由 APT 移除，Chrony 接手 |
-
-在有網路的 **WSL2** 從車端 APT 索引中的 `Filename` 配合 `https://ports.ubuntu.com/ubuntu-ports/` 下載；**版本與 SHA256 必須按實際車端 APT 索引確認**。下列檔名為本輪記錄：
-
-```bash
-mkdir -p ~/aicar-chrony-debs
-cd ~/aicar-chrony-debs
-BASE='https://ports.ubuntu.com/ubuntu-ports'
-
-curl -fL --retry 5 --retry-delay 3 --retry-all-errors -O \
-  "$BASE/pool/main/c/chrony/chrony_4.5-1ubuntu4.2_arm64.deb"
-curl -fL --retry 5 --retry-delay 3 --retry-all-errors -O \
-  "$BASE/pool/main/t/tzdata/tzdata_2026e-0ubuntu0.24.04.1_all.deb"
-curl -fL --retry 5 --retry-delay 3 --retry-all-errors -O \
-  "$BASE/pool/main/t/tzdata/tzdata-legacy_2026e-0ubuntu0.24.04.1_all.deb"
-```
-
-建立校驗清單（雜湊來自**當次車端 `apt-cache show`**）：
-
-```bash
-cat > SHA256SUMS <<'EOF_HASH'
-503d1f389dde1d540ae6f2c98bdac98040c70a2ce7d8da1458a8e04cd9dad1fd  chrony_4.5-1ubuntu4.2_arm64.deb
-2f6794a7f31753fc947d9ac02ff03ea46510f34864f9d132a93d7b105e3c4447  tzdata_2026e-0ubuntu0.24.04.1_all.deb
-da66b34322e7545f12bd97f2bd31c5f78406a9a9ec0ccfe284c3f3eb791647bf  tzdata-legacy_2026e-0ubuntu0.24.04.1_all.deb
-EOF_HASH
+apt-get -s install chrony
+# After transferring packages and the verified manifest to a dedicated directory:
 sha256sum -c SHA256SUMS
+apt-get -s install ./*.deb
 ```
 
-本輪第一次下載 chrony 遇到 HTTPS `Connection reset by peer`，重試後三個檔案皆 `OK`。
+**實際證據：** 三個下載套件均通過 SHA256 校驗。直接離線安裝曾因 APT 找不到對應 archives 而失敗，改依目標端仔細確認的版本及 APT cache 完成安裝；最終三個套件於 `dpkg -l` 均為 `ii`。這證明當時的離線相依處理成功，不代表所有 ARM64 主機會需要相同套件或版本。
 
-經由 WSL2 複製到 Pi：
+## 5.6 時間同步驗收與量測解讀
 
-```bash
-ssh ubuntu@192.168.123.1 'mkdir -p ~/aicar-chrony-debs'
-scp *.deb SHA256SUMS ubuntu@192.168.123.1:~/aicar-chrony-debs/
-```
-
-車端：
+先確認 NTP Server 可達、回覆格式有效，再驗證 Client 是否持續選用來源，最後檢查 ROS2 資料。收到 NTP 封包並不等於系統完成校時。
 
 ```bash
-cd ~/aicar-chrony-debs
-sha256sum -c SHA256SUMS
-sudo apt-get -s install ./*.deb
-
-# 本輪直接 --no-download install ./*.deb 曾失敗：Unable to fetch archives。
-# 將已校驗檔案置於 APT cache，再依確切版本安裝。
-sudo install -m 0644 ./*.deb /var/cache/apt/archives/
-sudo apt-get -s --no-download install \
-  chrony=4.5-1ubuntu4.2 \
-  tzdata=2026e-0ubuntu0.24.04.1 \
-  tzdata-legacy=2026e-0ubuntu0.24.04.1
-
-# 模擬結果符合預期才正式執行
-sudo apt-get --no-download install \
-  chrony=4.5-1ubuntu4.2 \
-  tzdata=2026e-0ubuntu0.24.04.1 \
-  tzdata-legacy=2026e-0ubuntu0.24.04.1
-```
-
-正式安裝前確認沒有控制／導航／感測時間戳程序需要持續運作。本輪完成後 `dpkg -l` 顯示三個套件狀態 `ii`。
-
-## 5.7 車端 Chrony Client 設定與首次校時
-
-Pi 的 `/etc/chrony/chrony.conf` 已有 `confdir /etc/chrony/conf.d` 與 `makestep 1 3`，**不需重複新增 `makestep`**。
-
-```bash
-sudo mkdir -p /etc/chrony/conf.d
-printf '%s\n' 'server 192.168.123.2 port 1123 iburst' \
-  | sudo tee /etc/chrony/conf.d/aicar-client.conf
-
-# 停止依賴時間戳的 ROS 2 控制／導航程序後執行
-sudo systemctl restart chrony
-chronyc -n sources -v
-chronyc tracking
 date -Is
 timedatectl status
+chronyc -n sources -v
+chronyc tracking
 ```
 
-首次同步會將車端日期從 2026-10-28 大幅校正至 2026-11-20。第一次 `Last offset` 曾記錄約 `-1,961,830 s`（歷史校時差），之後重新採樣結果：
+| 既有實測結果（有線診斷） | 解讀 |
+| --- | --- |
+| 車端收到 NTP 回覆，Leap Indicator = 0、Stratum = 3 | NTP Server 在當時可達並返回有效時間資訊 |
+| 車端日期由 2026-10-28 校正至 2026-11-20 | 實際系統時鐘發生大幅更新；該次初始偏差曾記錄約 −1,961,830 s |
+| Client `Reference ID` 對應本地 NTP Server、Stratum = 4 | 來源選擇與拓撲相符 |
+| `System time` 約慢 0.025 µs、`Last offset` 約 +23.89 µs | 特定時間點的 Chrony 狀態；不是跨主機絕對時間誤差 |
+| `Leap status: Normal`、`System clock synchronized: yes` | 此次同步狀態符合基本驗收 |
+| 重新驗證雙向 ROS2 Topic，未再觀察 timestamp 告警 | 同步後的通訊復驗通過（見 04） |
 
-```text
-Reference ID : 192.168.123.2
-Stratum      : 4
-System time  : approximately 0.025 microseconds slow
-Last offset  : approximately +23.89 microseconds
-Leap status  : Normal
-System clock synchronized: yes
-```
+`System time` 是本機系統時鐘與 Chrony 維護的虛擬 NTP 時鐘之間的當前修正量；`Last offset` 是最近一次時鐘更新的估算偏差，兩者不可直接當成 Pi–WSL2 端到端時間差。長期驗收還須觀察來源被選用、Reach、LastRx、RMS offset、網路延遲及重啟後是否仍同步，不能用一次小數值宣稱微秒級實車精度。
 
-不能只看一次大幅校時後的 `System time 0` 就判定穩定，應另看 `chronyc -n sources -v` 中的來源是否被選用、`Reach`、`LastRx`，以及後續 `tracking`。
+## 5.7 移交與驗收界線
 
-## 5.8 驗收與環境移交
+| 項目 | 狀態 |
+| --- | --- |
+| 有線 NTP Server、UDP 1123 及 Client 校時 | 已驗證（2026-11-20） |
+| 有線同步後 ROS2 雙向 Topic 復驗 | 已驗證（見 04） |
+| 無線正式場域的 NTP 來源、同步及重連 | 待復驗 |
+| 跨主機相對時差的長期統計、UTC 絕對精度 | 尚未完整驗證 |
+| IMU／JointState／Odometry／TF 實機端到端時間精度 | 待實機資料驗收 |
 
-- 完成時鐘同步後**重新啟動**原先使用舊時間戳的 ROS 2 Node，避免 TF／Odometry 留有舊資料。
-- 再驗證 [04 — Zenoh 雙向 Topic](04-zenoh-firewall.md)；本輪校時後未再看到 500 ms Timestamp 告警。
-- Pi 若重灌，Chrony、其 Client 設定與 Netplan 都要重建；Windows 防火牆規則仍在。
-- 切回學校 Wi-Fi 後，Pi 可能無法再到達 `192.168.123.2:1123`；應重新規劃可用時間來源，不要將此單一位址視為通用部署設定。
-- Chrony 同步狀態與跨主機時間差，不等於嚴格的 UTC 絕對時間校驗。
+切換至無線網路後重新核對 NTP 來源及 Router 端點，完成時間同步再啟動控制與感測節點，避免沿用有線或舊時間戳。主機校時、Middleware 傳輸及應用層資料有效性必須分別驗收。
 
-**參考：** [Chrony 4.5 Reference](https://chrony-project.org/doc/4.5/chrony.conf.html)。
+**參考：** [Chrony 4.5 Configuration Reference](https://chrony-project.org/doc/4.5/chrony.conf.html)、[Chrony 4.5 Monitoring](https://chrony-project.org/doc/4.5/chronyc.html)。
 
 **接續：** [06 — 程式環境 Smoke Test](06-smoke-tests.md)。
