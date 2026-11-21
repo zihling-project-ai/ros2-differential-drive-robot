@@ -92,6 +92,23 @@ ros2-differential-drive-robot/    # 工程專案／ROS2 workspace
 
 **設計判斷：** 大型機器人通常不會把所有控制功能集中在一支 `base.py` 裡，而是拆成不同控制器，再由更上層的控制模組協調。AICAR 規模較小且共用 DYNAMIXEL 通訊埠，因此目前保留單一 Base Node；各層只管理自己責任範圍的介面及限制，待規模增加再拆分，避免過度設計。
 
+### Base Callback 與控制迴圈
+
+`cb` 為 Callback（回呼函式）。Subscriber 的 `cb_reset()`、`cb_torque()`、`cb_tool()`、`cb_joint()`、`cb_cmd()` 接收並驗證、暫存命令；`cb_timer()` 負責定期執行硬體操作及發布回饋。目前目標頻率為 30 Hz。絕對目標採用最新有效指令（Latest-wins），不讓已過期的速度要求持續執行。
+
+建議修正後的控制順序（尚待實作與驗收）：
+
+```text
+Timer 觸發
+  ↓ 確認故障、命令逾時與停止要求（優先）
+  ↓ 處理有效且允許的控制命令
+  ↓ 讀取馬達實際回饋
+  ↓ 驗證資料與更新 Encoder 基準
+  ↓ 發布 JointState / Diff Rad
+```
+
+**設計理由：** 停止與故障優先於一般運動；目標指令不等於實際量測，應由有效回饋更新 ROS2 狀態。即使沒有新訊息，Timer 仍應檢查命令有效性。軟體 Timer 或馬達通訊可能延遲，不能取代獨立的硬體安全保護。
+
 ### 底層驅動模組：Arm 與 Wheel
 
 **模組目標：** `dxl_arm.py` 與 `dxl_wheel.py` 將設備通訊、型別轉換及有效資料回報封裝成 Python 介面；兩者不是 ROS2 Node。`aicar_base.py` 管理共用連線與操作時機，驅動層不負責 Topic、里程計積分或自主決策。硬體人工診斷另外放在 `diagnostics/`，離線測試放在 `test/`。
