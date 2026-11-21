@@ -1,14 +1,10 @@
 {
     "ROS2.distro": "jazzy",
     "python.autoComplete.extraPaths": [
-        "/home/zihling/ros2_ws/build/me333_pkg",
-        "/home/zihling/ros2_ws/install/me333_pkg/lib/python3.12/site-packages",
         "/opt/ros/jazzy/opt/gz_math_vendor/lib/python",
         "/opt/ros/jazzy/lib/python3.12/site-packages"
     ],
     "python.analysis.extraPaths": [
-        "/home/zihling/ros2_ws/build/me333_pkg",
-        "/home/zihling/ros2_ws/install/me333_pkg/lib/python3.12/site-packages",
         "/opt/ros/jazzy/opt/gz_math_vendor/lib/python",
         "/opt/ros/jazzy/lib/python3.12/site-packages"
     ]
