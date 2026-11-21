@@ -44,12 +44,20 @@ class AICAR_ODOM(Node):
         self.last_wheel_angles = None
 
         # --- Subscribers: use stamped cumulative wheel feedback ---
+        # Teacher TODO (original exercise): create the three subscribers.
+        #   /imu      (Imu)               -> cb_imu,       depth=10
+        #   /diff_rad (Float32MultiArray)  -> cb_calc_odom, depth=10
+        #   /reset    (Empty)             -> cb_reset,     depth=1
+        # Current design: replace the /diff_rad subscription with JointState
+        # for cumulative wheel angles and measurement timestamps.
         self.create_subscription(Imu, '/imu', self.cb_imu, 10)
         self.create_subscription(JointState, '/joint_states', self.cb_calc_odom, 10)
         self.create_subscription(Empty, '/reset', self.cb_reset, 1)
 
         # --- Publisher and TF broadcaster ---
+        # Teacher TODO (completed): create /odom (Odometry), depth=10.
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
+        # Teacher TODO (completed): create and store a TransformBroadcaster.
         self.broadcaster = tf2_ros.TransformBroadcaster(self)
 
         # --- Odometry message frames ---
@@ -59,7 +67,16 @@ class AICAR_ODOM(Node):
 
     # --- Subscriber callbacks ---
     def cb_reset(self, msg):
-        """Reset the software pose estimate, not the physical robot or IMU."""
+        """Teacher TODO (original exercise):
+
+        1. Log [ SET ] Odom reset.
+        2. Mark IMU feedback as not ready (imu_is_reset = False).
+        3. Reset x, y and theta to zero.
+        4. Clear the stored IMU angular velocity.
+
+        Current design: also clear both wheel and time baselines and reject
+        pre-reset measurements. This does not reset the physical robot or IMU.
+        """
         self.get_logger().info('[ SET ] Odom reset')
         now = self._observe_clock()
         self.reset_stamp_ns = now.nanoseconds
@@ -69,7 +86,14 @@ class AICAR_ODOM(Node):
         self.last_wheel_angles = None
 
     def cb_imu(self, msg):
-        """Store only the newest valid gyro Z rate and its measurement time."""
+        """Teacher TODO (original exercise):
+
+        1. Read msg.angular_velocity.z and store the angular velocity.
+        2. Mark IMU feedback as ready.
+
+        Current design: readiness requires a valid, fresh timestamp, not just
+        the receipt of any message.
+        """
         now = self._observe_clock()
         stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
         age = (now.nanoseconds - stamp) / 1e9
@@ -113,7 +137,24 @@ class AICAR_ODOM(Node):
                 0.0 <= receive_age <= IMU_TIMEOUT_SEC)
 
     def cb_calc_odom(self, msg):
-        """Integrate stamped cumulative wheel angles and gyro rate into a planar pose."""
+        """Teacher TODO (original nine-step odometry exercise):
+
+        1. Return if IMU feedback is not ready.
+        2. If both wheel increments are zero, use zero angular velocity;
+           otherwise use the IMU Z angular velocity.
+        3. Calculate dt from the current and previous times; reject dt <= 0.
+        4. Multiply the left and right wheel angular increments by the radius.
+        5. Divide the mean wheel distance by dt to obtain linear velocity.
+        6. Integrate x, y and theta using velocity, heading and dt.
+        7. Publish Odometry: planar position, yaw quaternion, linear and
+           angular velocity, with the estimate timestamp.
+        8. Broadcast odom -> base_footprint using the same pose and rotation.
+        9. Keep the current time as the next integration baseline.
+
+        Current design: validate stamped cumulative feedback before taking
+        differences, use acquisition timestamps rather than callback arrival,
+        and use midpoint heading in the position integration.
+        """
         now = self._observe_clock()
         stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
         # Step 1: Reject stale, future, duplicate and pre-reset wheel samples.
