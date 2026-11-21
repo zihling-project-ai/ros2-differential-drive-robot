@@ -6,7 +6,7 @@ Repository 的 `docker/Dockerfile` 與 `.github/workflows/ci.yml` 已驗證：Py
 
 ## 1. 目標
 
-在家用 Apple Silicon Mac 開發 AICAR ROS2，回學校可繼續相同版本的測試。避免在 macOS 分別安裝 ROS2、Gazebo、RViz2、Zenoh 等套件。以容器封裝環境、Git 管理程式與部署定義，不把實車環境直接當成家用模擬環境。
+在 Apple Silicon Mac 開發 AICAR ROS2，於另一台開發主機繼續相同版本的測試。避免在 macOS 分別安裝 ROS2、Gazebo、RViz2、Zenoh 等套件。以容器封裝環境、Git 管理程式與部署定義，不把實車環境直接當成離線模擬環境。
 
 Docker 可降低套件版本差異，但不能解決所有 CPU、圖形加速、實體裝置與網路差異。Mac 仍需要可執行 Linux 容器的運行環境，例如 Docker Desktop；其背後會使用 Linux 虛擬機。
 
@@ -14,7 +14,7 @@ Docker 可降低套件版本差異，但不能解決所有 CPU、圖形加速、
 
 | 主機 | 用途 | 優先架構 | 注意事項 |
 | --- | --- | --- | --- |
-| 學校 Windows/WSL2 | Gazebo、RViz2、開發 | `linux/amd64`（以實際 `uname -m` 為準） | 完整圖形測試優先在此進行 |
+| 開發端 Windows/WSL2 | Gazebo、RViz2、開發 | `linux/amd64`（以實際 `uname -m` 為準） | 完整圖形測試優先在此進行 |
 | 家中 Apple Silicon Mac | 文件、程式碼、單元測試、無介面模擬 | `linux/arm64` | 不假設容器可直接存取原生 GPU 或顯示視窗 |
 | Raspberry Pi | 實體裝置整合 | 以實際系統架構為準；64-bit OS 通常為 `linux/arm64` | 實車專用配置；不可用家中模擬設定誤啟動 |
 
@@ -72,11 +72,11 @@ docker buildx build --platform linux/arm64 --load \
   -f docker/Dockerfile -t aicar-dev:jazzy-arm64 .
 ```
 
-在學校也可為自身環境建置 `linux/amd64`，使用 `aicar-dev:jazzy-amd64` 標籤。跨架構建置可能使用模擬，較慢；有條件時使用對應架構原生建置。
+在 AMD64 開發端也可建置 `linux/amd64`，使用 `aicar-dev:jazzy-amd64` 標籤。跨架構建置可能使用模擬，較慢；有條件時使用對應架構原生建置。
 
-## 6. 在學校匯出，到家匯入
+## 6. 跨主機匯出與匯入
 
-學校（確認 ARM64 映像已建置）：
+來源開發端（確認 ARM64 映像已建置）：
 
 ```bash
 docker image inspect --format '{{.Os}}/{{.Architecture}}' aicar-dev:jazzy-arm64
@@ -143,7 +143,7 @@ gz sim -s shapes.sdf
 
 | 方案 | 優點 | 限制 |
 | --- | --- | --- |
-| 學校 WSL2/WSLg | 沿用已知環境 | 需在學校電腦使用 |
+| 開發端 WSL2/WSLg | 沿用已知環境 | 需有相容的 Windows 開發主機 |
 | Mac Docker 無介面 | 減少額外安裝，適合 Node/資料測試 | 沒有直接 3D 視窗；渲染感測器仍需驗證 |
 | Linux 容器 + 瀏覽器遠端桌面（例如 noVNC） | Mac 不需安裝額外 X Server | 額外映像、顯示服務與資源；只應本機存取 |
 | Ubuntu ARM64 虛擬機 | 完整 Linux 桌面 | 佔用更多磁碟、記憶體；3D 加速需測試 |
@@ -162,7 +162,7 @@ gz sim -s shapes.sdf
 
 | 項目 | 通過標準 | 狀態 |
 | --- | --- | --- |
-| 建置 AMD64 Image | GitHub Runner 建置與執行 | PASS（CI；學校另行重現） |
+| 建置 AMD64 Image | GitHub Runner 建置與執行 | PASS（CI；開發端另行重現） |
 | 建置 ARM64 Image | Mac 可載入、啟動 | 待驗證 |
 | Image 匯出／匯入 | 版本、架構、標籤正確 | 待驗證 |
 | ROS2 CLI | `ros2 pkg prefix ai_car` 發現套件 | PASS（CI） |
