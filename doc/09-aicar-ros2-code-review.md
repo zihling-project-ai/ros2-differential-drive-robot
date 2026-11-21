@@ -2,7 +2,7 @@
 
 更新日期：2026-11-21　｜　狀態：第一輪靜態審查／逐段學習中
 
-> **重要：審查基準更新。** 下方第一輪行號指向先前獨立的 278 行硬體停用安全骨架，不是本 Repository 的正式 383 行 `src/ai_car/ai_car/aicar_base.py`。不得將舊版 `hardware_enabled=False` 特性誤認為正式版本已具備的安全功能。目前手臂驅動已合併 PR #5，車輪驅動重構位於草稿 PR #6；兩者均尚未完成實車驗收。
+> **重要：審查基準更新。** 下方第一輪行號指向先前獨立的 278 行硬體停用安全骨架，不是本 Repository 的原始正式 `src/ai_car/ai_car/aicar_base.py`。不得將舊版 `hardware_enabled=False` 特性誤認為正式版本已具備的安全功能。目前手臂驅動已合併 PR #5，車輪驅動與 Base Node 重構位於草稿 PR #6；均尚未完成實車驗收。
 
 ## 0. Repository 目錄與同名程式比較
 
@@ -55,11 +55,12 @@ ros2-differential-drive-robot/    # 工程專案／ROS2 workspace
 
 | 來源 | 狀態 |
 | --- | --- |
-| `aicar_base.py`（278 行） | 已逐行讀取；Python 語法檢查通過，尚未做 ROS2 執行測試 |
+| 早期 `aicar_base.py` 安全骨架（278 行） | 歷史靜態審查基準；不是目前正式程式 |
+| 本 Repository `ai_car/ai_car/aicar_base.py` | 已逐段審查並於 PR #6 重構；離線單元測試通過，待實車驗收 |
 | 老師公開的 [ai_car 倉庫](https://github.com/zhl017/ai_car) | 公開首頁顯示 ROS1 Noetic；不能當作目前 ROS2 原始碼 |
-| DYNAMIXEL 驅動、Odometry/IMU、URDF、Launch、YAML、Zenoh | 完整 ROS2 原始碼與配置待補 |
+| DYNAMIXEL 驅動、Odometry/IMU、URDF、Launch、YAML | 已取得本 Repository 原始碼；驅動已重構，其餘模組尚待逐段審查 |
 
-目前取得的是一份硬體停用版 `aicar_base.py`，不是已驗證的正式實車版本。以下行號以本次取得檔案為準。P0/P1/P2 表示修復或驗收優先級，而非事故發生機率。
+P0/P1/P2 表示修復或驗收優先級，而非事故發生機率。第 4 節保留先前安全骨架的歷史審查結果；目前實作以 PR #6 為準。
 
 ## 2. ROS2 模組地圖
 
@@ -94,9 +95,9 @@ ros2-differential-drive-robot/    # 工程專案／ROS2 workspace
 
 ### Base Callback 與控制迴圈
 
-`cb` 為 Callback（回呼函式）。Subscriber 的 `cb_reset()`、`cb_torque()`、`cb_tool()`、`cb_joint()`、`cb_cmd()` 接收並驗證、暫存命令；`cb_timer()` 負責定期執行硬體操作及發布回饋。目前目標頻率為 30 Hz。絕對目標採用最新有效指令（Latest-wins），不讓已過期的速度要求持續執行。
+`cb` 為 Callback（回呼函式）。Subscriber 的 `cb_reset()`、`cb_torque()`、`cb_wheel_torque()`、`cb_tool()`、`cb_joint()`、`cb_cmd()` 接收並驗證、暫存命令；`cb_timer()` 負責定期執行硬體操作及發布回饋。目前目標頻率為 30 Hz。絕對目標採用最新有效指令（Latest-wins），停止與停用要求優先；已過期的速度目標不能繼續使用。
 
-建議修正後的控制順序（尚待實作與驗收）：
+草稿 PR #6 的控制順序（尚待實車驗收）：
 
 ```text
 Timer 觸發
@@ -108,6 +109,8 @@ Timer 觸發
 ```
 
 **設計理由：** 停止與故障優先於一般運動；目標指令不等於實際量測，應由有效回饋更新 ROS2 狀態。即使沒有新訊息，Timer 仍應檢查命令有效性。軟體 Timer 或馬達通訊可能延遲，不能取代獨立的硬體安全保護。
+
+**介面約定：** 既有 `/torque` 仍為手臂控制；新增 `/wheel_torque` 作為獨立車輪啟用介面。軟體啟用權限預設關閉（不代表已測量實際扭矩狀態）；啟用後才接受新的運動目標。`/reset` 要求車輪停止並重建 Encoder 基準，不自動移動手臂或切換控制模式；回原位（Home Pose）屬於獨立的位置運動需求，而非數值歸零。`command_timeout_sec` 預設 0.5 秒，待 Teleop 及通訊驗收；關閉時不自動回原位或移除手臂支撐扭矩。此介面不是安全認證的急停系統。
 
 ### 底層驅動模組：Arm 與 Wheel
 
@@ -136,22 +139,23 @@ Timer 觸發
 | `set_wheel(set_data)` | 接收左右側有號速度原始值；驗證後依既有對應編碼與通訊 |
 | `get_wheel()` | 驗證並回傳四輪有號 Encoder Tick，順序為左前、右前、左後、右後 |
 
-**設計決策與驗證：** 保留原有硬體 ID、零點、方向、協定及換算參數，不新增配置框架。關節的度數與弧度、車輪的有號物理值與無號封包表示分開處理。PR #5（Arm）已合併，PR #6（Wheel）仍為草稿；目前 22 項假 SDK 離線測試通過。實際機械限制、模式與停止狀態須現場確認，Base 的明確啟用、故障處理及 Encoder 基準管理尚待整合。
+**設計決策與驗證：** 保留原有硬體 ID、零點、方向、協定及換算參數，不新增配置框架。關節的度數與弧度、車輪的有號物理值與無號封包表示分開處理。PR #5（Arm）已合併，PR #6（Wheel／Base）仍為草稿；目前 36 項離線單元測試通過。實際機械限制、模式、Encoder 連續性及停止狀態仍須現場確認；Base 介面整合不等同於實車安全驗收。
 
-## 3. `aicar_base.py` 逐段閱讀路線
+## 3. `aicar_base.py` 重構介面與設計判斷（PR #6）
 
-| 順序 | 行號 | 學習內容 | 讀完應能解釋 |
-| --- | --- | --- | --- |
-| 01 | 1–36 | 檔案說明、import、常數、`constrain()` | 模組的責任、單位、速度限制 |
-| 02 | 38–95 | Node 初始化、參數、Topic、Timer | 為什麼硬體預設停用；Publisher/Subscriber |
-| 03 | 97–146 | Reset、Torque、Joint、Tool、Twist callbacks | 收到訊息和執行控制的區別 |
-| 04 | 148–202 | Timer、逾時、故障、Reset 狀態 | 命令生命週期與失效處理 |
-| 05 | 204–231 | 編碼器與 JointState | 角度、增量、基準、有效量測 |
-| 06 | 233–278 | Shutdown 與 main | Node 啟動、spin、資源清理 |
+| 函式／區塊 | 責任與原因 |
+| --- | --- |
+| `constrain()`、`twist_to_wheel_values()` | 明確區分車體線速度、輪角速度與馬達數值；同比例限速保留理想運動學比例 |
+| `encoder_delta()` | 計算有號 32-bit 回繞增量；硬體重新啟動造成的量測不連續仍需另外驗證 |
+| `__init__()` | 共用一個 Port；驗證連線、建立 Topic 與 Timer，部分初始化失敗時清理資源 |
+| `cb_reset()`、Torque、Tool、Joint、Twist callbacks | 將有效要求暫存，與 Timer 的硬體 I/O 分離；不把資料 Reset 等同於回原位 |
+| `cb_timer()` | 停止優先、命令逾時、處理有效目標、讀取和發布回饋；故障時鎖定而非自動重啟 |
+| `fn_update_states()` | 建立首次 Encoder 基準、保留低速增量並驗證所有回饋；暫保留前兩輪 `/diff_rad` 契約 |
+| `fn_shutdown()`、`main()` | 停止請求與資源清理分開，不依賴等待時間或自動手臂移動證明安全 |
 
-學習流程：先讀原碼 → 用自己的話解釋 → 找出反例或測試 → 決定修復 → 重跑測試 → 更新本文。每次只改已理解的問題。
+英文註解保留原教學步驟並補上設計原因。36 項假硬體離線測試已通過；ROS2 容器驗收與實車測試仍需分別追蹤。
 
-## 4. 第一輪程式碼審查
+## 4. 第一輪程式碼審查（歷史：278 行安全骨架）
 
 ### 4.1 P0 — 實車部署阻擋條件
 

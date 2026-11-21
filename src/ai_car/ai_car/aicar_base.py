@@ -1,382 +1,479 @@
 #!/usr/bin/env python3
 
+# Python standard library
+import math
 import time
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import *
-from sensor_msgs.msg import JointState
-from dynamixel_sdk import PortHandler
-from geometry_msgs.msg import Twist
-from ai_car.dxl_arm import Arm_Controller
-from ai_car.dxl_wheel import Wheel_Controller
 
-# ── 常數定義 ────────────────────────────────────────────────
-BAUD_RATE        = 1000000   # Dynamixel 通訊鮑率
-WHEEL_SEPERATION = 0.16      # 左右輪距 (m)
-LIMIT_VEL        = 265       # 最大速度值
-TIRE             = 0.033     # 輪胎半徑
-VELOCITY2VALUE   = 41.69988758
-XM_TICK2RAD      = 0.001533981
+# ROS 2 core and clocks
+import rclpy
+from rclpy.clock import Clock, ClockType
+from rclpy.node import Node
+
+# ROS 2 message interfaces
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Empty, Float32MultiArray, Int8, Int32, Int32MultiArray
+
+# Hardware transport and driver interfaces
+from dynamixel_sdk import PortHandler
+from ai_car.dxl_arm import Arm_Controller, JOINT_MAX_DEG, TOOL_MAX_DEG
+from ai_car.dxl_wheel import Wheel_Controller, VELOCITY_COMMAND_LIMIT, XM_TICK2RAD
+
+# --- Original hardware and vehicle parameters ---
+BAUD_RATE = 1000000
+WHEEL_SEPARATION = 0.16  # Left-to-right wheel center distance (m).
+WHEEL_RADIUS = 0.033      # Rolling radius (m).
+VELOCITY2VALUE = 41.69988758  # Motor velocity units per rad/s.
+LIMIT_VEL = VELOCITY_COMMAND_LIMIT  # Shared software limit, not a measured hardware limit.
 
 
 def constrain(vel):
-    if vel < -LIMIT_VEL: return -LIMIT_VEL
-    if vel > LIMIT_VEL: return LIMIT_VEL
-    return vel
+    """Keep the final motor command inside the existing software limit."""
+    return max(-LIMIT_VEL, min(LIMIT_VEL, vel))
+
+
+def twist_to_wheel_values(linear, angular):
+    """Convert a planar body velocity to two signed motor velocity values."""
+    if not math.isfinite(linear) or not math.isfinite(angular):
+        raise ValueError('Twist values must be finite')
+
+    # 1. Differential-drive kinematics: body twist -> wheel linear speeds (m/s).
+    left_mps = linear - angular * WHEEL_SEPARATION / 2
+    right_mps = linear + angular * WHEEL_SEPARATION / 2
+
+    # 2. Separate physical units from the device representation (rad/s -> raw units).
+    left_rad_s = left_mps / WHEEL_RADIUS
+    right_rad_s = right_mps / WHEEL_RADIUS
+    left_value = left_rad_s * VELOCITY2VALUE
+    right_value = right_rad_s * VELOCITY2VALUE
+    if not math.isfinite(left_value) or not math.isfinite(right_value):
+        raise ValueError('Wheel velocity conversion overflowed')
+
+    # 3. Scale both sides together if needed, preserving the requested curvature.
+    peak = max(abs(left_value), abs(right_value))
+    if peak > LIMIT_VEL:
+        scale = LIMIT_VEL / peak
+        left_value *= scale
+        right_value *= scale
+    return [int(constrain(left_value)), int(constrain(right_value))]
+
+
+def encoder_delta(current, previous):
+    """Find a signed tick difference across a 32-bit rollover."""
+    # This assumes less than half the counter range between samples; a hardware
+    # reboot or position reset is a separate discontinuity, not a normal rollover.
+    delta = (current - previous + 2**31) % 2**32 - 2**31
+    if delta == -2**31:
+        raise ValueError('Ambiguous encoder rollover')
+    return delta
+
 
 class AICAR_BASE(Node):
     def __init__(self):
         super().__init__('aicar_base')
 
-        # --- 初始化 Dynamixel Port ---
-        self.get_logger().info('Connect U2D2 ...')        
-        # TODO: 建立 PortHandler 實例，連接 U2D2
-        self.dxl_port = PortHandler('/dev/U2D2')
-        
-        try:
-            # TODO: 設定鮑率，成功後印出 '[ OK ] AICAR start'
-            self.dxl_port.openPort()
-            self.baud = self.dxl_port.setBaudRate(BAUD_RATE)
-            self.get_logger().info(f"[ OK ] AICAR start")
-            
-        except Exception as e:
-            self.get_logger().error(f'{e}')
-            raise SystemExit
+        # Initialize cleanup state first so a partial startup can be handled.
+        self.dxl_port = None
+        self.arm = None
+        self.wheel = None
+        self.timer = None
+        self.closed = False
+        self.faulted = False
+        # These are software command permissions, not measured torque states.
+        self.arm_enabled = False
+        self.wheel_enabled = False
 
-        # TODO: 建立 Arm_Controller 與 Wheel_Controller 實例
-        self.arm   = Arm_Controller(self.dxl_port)
-        self.wheel = Wheel_Controller(self.dxl_port)
-
-        # --- Subscribers ---
-        # TODO: 建立以下五個 Subscriber，綁定對應的 callback
-        #   /reset        (Empty)            → cb_reset
-        #   /torque       (Int8)             → cb_torque
-        #   /tool         (Int32)            → cb_tool
-        #   /joint        (Int32MultiArray)  → cb_joint
-        #   /cmd_vel      (Twist)            → cb_cmd
-        self.reset_sub = self.create_subscription(Empty, '/reset', self.cb_reset, 10)
-        self.torque_sub = self.create_subscription(Int8, '/torque', self.cb_torque, 10)
-        self.tool_sub = self.create_subscription(Int32, '/tool', self.cb_tool, 10)
-        self.joint_sub = self.create_subscription(Int32MultiArray, '/joint',self.cb_joint, 10)
-        self.cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self.cb_cmd, 10)
-
-        # --- Publishers ---
-        # TODO: 建立以下兩個 Publisher
-        #   /joint_states  (JointState)         queue=1
-        #   /diff_rad      (Float32MultiArray)  queue=1
-        self.joint_states_pub = self.create_publisher(JointState, '/joint_states', 1)
-        self.diff_rad_pub     = self.create_publisher(Float32MultiArray, '/diff_rad', 1)
-
-        # --- JointState 初始化 ---
-        self.joint_states = JointState()
-        self.joint_states.name = [
-            'wheel_left_joint',
-            'wheel_right_joint',
-            'wheel_rear_left_joint',
-            'wheel_rear_right_joint',
-            'arm_joint_1',
-            'arm_joint_2',
-            'tool_joint'
-        ]
-
-        # --- 狀態變數 ---
+        # --- Command state ---
+        # Callbacks keep the latest valid target; the timer alone performs I/O.
         self.torque_data = 0
-        self.tool_data   = 0.0
-        self.joint_data  = [0.0, 0.0]
-        self.cmd_data    = [0.0, 0.0]
-
-        self.reset_received  = False
+        self.wheel_torque_data = 0
+        self.tool_data = 0
+        self.joint_data = [0, 0]
+        self.cmd_data = [0, 0]
+        self.reset_received = False
         self.torque_received = False
-        self.tool_received   = False
-        self.joint_received  = False
-        self.cmd_received    = False
+        self.wheel_torque_received = False
+        self.tool_received = False
+        self.joint_received = False
+        self.cmd_received = False
+        self.wheel_stop_requested = False
+        self.last_cmd_time = None
 
-        self.state_is_reset    = False
-        self.last_left         = self.last_right         = 0
-        self.last_rear_left    = self.last_rear_right    = 0
-        self.diff_left         = self.diff_right         = 0
-        self.diff_rear_left    = self.diff_rear_right    = 0
-        self.total_left        = self.total_right        = 0
-        self.total_rear_left   = self.total_rear_right   = 0
+        # --- Encoder state (LF, RF, LR, RR) ---
+        # None means the first valid read must establish a new baseline.
+        self.last_wheel_ticks = None
+        self.diff_wheel_rad = [0.0] * 4
+        self.total_wheel_rad = [0.0] * 4
+        self.arm_states = []
 
-        # --- 主迴圈 Timer (30 Hz) ---
-        # TODO: 建立一個 30 Hz 的 Timer，callback 為 cb_timer
-        self.timer = self.create_timer(1.0 / 30.0, self.cb_timer)
-        
-       
+        try:
+            # A timeout limits stale commands; validate it before opening the port.
+            self.command_timeout = float(
+                self.declare_parameter('command_timeout_sec', 0.5).value
+            )
+            if not math.isfinite(self.command_timeout) or self.command_timeout <= 0:
+                raise ValueError('command_timeout_sec must be finite and positive')
 
-    # ── Subscriber Callbacks ────────────────────────────────
+            # --- Initialize the DYNAMIXEL port ---
+            # Teacher steps: create PortHandler, open port, set baud rate, log success.
+            # SDK methods return status values; a lack of exceptions is not proof of success.
+            self.get_logger().info('Connect U2D2 ...')
+            self.dxl_port = PortHandler('/dev/U2D2')
+            if not self.dxl_port.openPort():
+                raise RuntimeError('Cannot open /dev/U2D2')
+            if not self.dxl_port.setBaudRate(BAUD_RATE):
+                raise RuntimeError('Cannot configure DYNAMIXEL baud rate')
+
+            # Teacher step: construct both controllers using one shared port.
+            # Verify and request a wheel stop first; creating a controller must
+            # not authorize motion or automatically home the arm.
+            self.wheel = Wheel_Controller(self.dxl_port)
+            self.arm = Arm_Controller(self.dxl_port)
+
+            # --- Subscribers ---
+            # Teacher steps: register the original five interfaces and callbacks.
+            # Preserve /torque as arm-only; a separate request enables the wheels.
+            self.reset_sub = self.create_subscription(Empty, '/reset', self.cb_reset, 10)
+            self.torque_sub = self.create_subscription(Int8, '/torque', self.cb_torque, 10)
+            self.tool_sub = self.create_subscription(Int32, '/tool', self.cb_tool, 1)
+            self.joint_sub = self.create_subscription(Int32MultiArray, '/joint', self.cb_joint, 1)
+            self.cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self.cb_cmd, 1)
+            self.wheel_torque_sub = self.create_subscription(
+                Int8, '/wheel_torque', self.cb_wheel_torque, 10
+            )
+
+            # --- Publishers ---
+            # Teacher steps: publish JointState and left/right angular increments.
+            self.joint_states_pub = self.create_publisher(JointState, '/joint_states', 1)
+            self.diff_rad_pub = self.create_publisher(Float32MultiArray, '/diff_rad', 1)
+
+            # --- JointState initialization ---
+            # Keep the names and ordering consistent with the URDF and driver feedback.
+            self.joint_states = JointState()
+            self.joint_states.name = [
+                'wheel_left_joint',
+                'wheel_right_joint',
+                'wheel_rear_left_joint',
+                'wheel_rear_right_joint',
+                'arm_joint_1',
+                'arm_joint_2',
+                'tool_joint',
+            ]
+
+            # --- Main control timer (30 Hz) ---
+            # Teacher step: periodically read feedback and handle queued commands.
+            # Use steady time for watchdog scheduling, so ROS-time jumps cannot
+            # extend freshness. Message stamps still use the ROS clock.
+            self.timer = self.create_timer(
+                1.0 / 30.0, self.cb_timer, clock=Clock(clock_type=ClockType.STEADY_TIME)
+            )
+            self.get_logger().info('[ OK ] AICAR start; motion permissions are disabled')
+        except BaseException:
+            # Construction may fail after opening the port or one controller succeeds.
+            self.fn_shutdown()
+            self._try_cleanup('destroy node', self.destroy_node)
+            raise
+
+    # --- Subscriber callbacks ---
 
     def cb_reset(self, msg):
-        """
-        TODO:
-        1. 印出 '[ SET ] AICAR reset'
-        2. 將 total / last 里程計歸零
-        3. 設定 state_is_reset = False
-        4. 設定 reset_received  = True
-        """
-        self.get_logger().info(f'[ SET ] AICAR reset')
-
-        self.total_left = self.total_right = 0
-        self.total_rear_left = self.total_rear_right = 0
-        self.last_left = self.last_right = 0    
-        self.last_rear_left = self.last_rear_right = 0
-
-        self.state_is_reset = False
+        """Teacher steps: log reset, clear odometry baseline, set reset flag."""
+        if self.closed or self.faulted:
+            return
+        self.get_logger().info('[ SET ] AICAR reset')
+        # A reset invalidates pending motion instead of replaying pre-reset targets.
+        self._clear_motion_commands()
         self.reset_received = True
 
     def cb_torque(self, msg):
-        """
-        TODO:
-        1. 印出 '[ SET ] ARM Torque : {msg.data}'
-        2. 儲存 torque_data
-        3. 設定 torque_received = True
-        """
+        """Teacher steps: read, log and store the arm torque request."""
+        if self.closed or self.faulted:
+            return
+        if msg.data not in (0, 1):
+            self.get_logger().warning('Invalid arm torque request')
+            return
+        # A pending disable takes priority over a later enable in the same cycle.
+        if self.torque_received and self.torque_data == 0 and msg.data == 1:
+            return
         self.get_logger().info(f'[ SET ] ARM Torque : {msg.data}')
         self.torque_data = msg.data
         self.torque_received = True
+        self.tool_received = self.joint_received = False
+
+    def cb_wheel_torque(self, msg):
+        """Record explicit wheel activation separately from the arm interface."""
+        if self.closed or self.faulted:
+            return
+        if msg.data not in (0, 1):
+            self.get_logger().warning('Invalid wheel torque request')
+            return
+        if self.wheel_torque_received and self.wheel_torque_data == 0 and msg.data == 1:
+            return
+        self.wheel_torque_data = msg.data
+        self.wheel_torque_received = True
+        self._clear_wheel_command()
 
     def cb_tool(self, msg):
-        """
-        TODO: 只在 tool_received 為 False 時處理：
-        1. 印出 '[ SET ] ARM Tool : {msg.data:.2f}'
-        2. 儲存 tool_data
-        3. 設定 tool_received = True
-        """
-        if not self.tool_received:
-            self.get_logger().info(f'[ SET ] ARM Tool : {msg.data:.2f}')
-            self.tool_data = msg.data
-            self.tool_received = True
+        """Teacher steps: validate, log and store the tool target and pending flag."""
+        if self.closed or self.faulted or not self.arm_enabled or self.reset_received:
+            return
+        if not 0 <= msg.data <= TOOL_MAX_DEG:
+            self.get_logger().warning('Invalid tool angle')
+            return
+        if self.torque_received:
+            return
+        # An absolute setpoint uses latest-wins, not a queue of older positions.
+        self.get_logger().info(f'[ SET ] ARM Tool : {msg.data:.2f}')
+        self.tool_data = msg.data
+        self.tool_received = True
 
     def cb_joint(self, msg):
-        """
-        TODO: 只在 joint_received 為 False 時處理：
-        1. 印出 '[ SET ] ARM Joint : {msg.data[0]:.2f}, {msg.data[1]:.2f}'
-        2. 儲存 joint_data
-        3. 設定 joint_received = True
-        """
-        if self.joint_received == False:
-
-            self.get_logger().info(
-            f'[ SET ] ARM Joint : {msg.data[0]:.2f}, {msg.data[1]:.2f}'
-            )
-
-            self.joint_data = msg.data
-            self.joint_received = True
+        """Teacher steps: validate, log and store two joint targets and pending flag."""
+        if self.closed or self.faulted or not self.arm_enabled or self.reset_received:
+            return
+        if len(msg.data) != 2 or not all(0 <= angle <= JOINT_MAX_DEG for angle in msg.data):
+            self.get_logger().warning('Expected two valid joint angles')
+            return
+        if self.torque_received:
+            return
+        self.get_logger().info(f'[ SET ] ARM Joint : {msg.data[0]:.2f}, {msg.data[1]:.2f}')
+        self.joint_data = list(msg.data)
+        self.joint_received = True
 
     def cb_cmd(self, msg):
-        """
-        TODO: 只在 cmd_received 為 False 時處理：
-        1. 從 msg.linear.x 與 msg.angular.z 計算差速驅動的左右輪速度：
-               left_vel  = lin_vel - ang_vel * WHEEL_SEPERATION / 2
-               right_vel = lin_vel + ang_vel * WHEEL_SEPERATION / 2
-        2. 將速度換算成 Dynamixel 數值 (乘以 VELOCITY2VALUE / 0.033)
-        3. 用 constrain() 限制數值範圍
-        4. 印出 '[ SET ] WHEEL : {int(left_vel)}, {int(right_vel)}'
-        5. 儲存 cmd_data，設定 cmd_received = True
-        """
-        if self.cmd_received == False:
-            
-            # 1. 取得 ROS2 Twist 速度
-            lin_vel = msg.linear.x
-            ang_vel = msg.angular.z
+        """Teacher steps: read Twist, convert wheel speeds, limit, log and store."""
+        if (self.closed or self.faulted or not self.wheel_enabled or self.reset_received
+                or self.wheel_torque_received or self.wheel_stop_requested):
+            return
+        # Only valid, fresh commands can be executed. A malformed command clears
+        # any existing target rather than leaving an old motion request active.
+        try:
+            values = twist_to_wheel_values(msg.linear.x, msg.angular.z)
+        except ValueError as exc:
+            self.get_logger().warning(f'Invalid /cmd_vel: {exc}')
+            self._clear_wheel_command()
+            self.wheel_stop_requested = True
+            return
 
-            # 2. 差速輪運動學
-            left_vel = lin_vel - ang_vel * WHEEL_SEPERATION / 2
-            right_vel = lin_vel + ang_vel * WHEEL_SEPERATION / 2
+        if values == [0, 0]:
+            # A stop request takes priority until the next control cycle handles it.
+            self._clear_wheel_command()
+            self.wheel_stop_requested = True
+            return
+        self.get_logger().debug(f'[ SET ] WHEEL : {values[0]}, {values[1]}')
+        self.cmd_data = values
+        self.cmd_received = True
+        # Freshness means local reception time; Twist itself has no timestamp.
+        self.last_cmd_time = time.monotonic()
 
-            # 3. 轉換成 Dynamixel 速度數值
-            left_vel = left_vel * VELOCITY2VALUE / 0.033
-            right_vel = right_vel * VELOCITY2VALUE / 0.033
-
-            # 4. 限制速度
-            left_vel = constrain(left_vel)
-            right_vel = constrain(right_vel)
-
-            # 5. 顯示結果
-            self.get_logger().info(
-                f'[ SET ] WHEEL : {int(left_vel)}, {int(right_vel)}'
-            )
-
-            # 6. 儲存控制命令
-            self.cmd_data = [int(left_vel), int(right_vel)]
-            self.cmd_received = True
-
-    # ── 主 Timer Callback ───────────────────────────────────
+    # --- Main timer callback ---
 
     def cb_timer(self):
         """
-        TODO (依序完成):
-        1. 呼叫 fn_update_states() 更新感測器狀態
-        2. 發布 /joint_states (包含 7 個關節位置)
-        3. 發布 /diff_rad     (left, right 差值)
-        4. 若 tool_received  → 執行 arm.set_tool()    並清旗標
-        5. 若 joint_received → 執行 arm.set_joint()   並清旗標
-        6. 若 cmd_received   → 執行 wheel.set_wheel() 並清旗標
-        7. 若 reset_received → 執行 arm.reset() 與 wheel.reset()，
-                               建立一個 2 秒後觸發 cb_flag 的 Timer，並清旗標
-        8. 若 torque_received→ 執行 arm.set_torque()  並清旗標
+        Teacher tasks: update states; publish joint states and diff_rad; process
+        tool, joint, wheel, reset and torque requests. Safety-related requests
+        are now handled first so stale or pending movement cannot outrank a stop.
         """
-        # 1：更新感測器狀態
-        self.fn_update_states()
+        if self.closed or self.faulted:
+            return
+        try:
+            # 1. Reset the software baseline and request a wheel stop.
+            # The original teacher reset changed motor modes, homed the arm and
+            # used a 2-second cb_flag timer. A valid encoder sample is the new
+            # baseline; shared odometry reset must not unexpectedly move the arm.
+            if self.reset_received:
+                self._clear_motion_commands()
+                self.wheel.reset()
+                self.last_wheel_ticks = None
+                self.diff_wheel_rad = [0.0] * 4
+                self.total_wheel_rad = [0.0] * 4
+                self.reset_received = False
+                if self.torque_data == 1:
+                    self.torque_received = False
+                if self.wheel_torque_data == 1:
+                    self.wheel_torque_received = False
 
-        # 2：發布 /joint_states
+            # 2. Process explicit torque-off requests before any ordinary motion.
+            if self.wheel_torque_received and self.wheel_torque_data == 0:
+                self.wheel_enabled = False
+                self._clear_wheel_command()
+                self.wheel.reset()
+                self.wheel.set_torque(0)
+                self.wheel_torque_received = False
+            # 3. Check command age even when no subscriber callback arrives.
+            # A ROS timer is not an independent hardware safety watchdog.
+            if (self.last_cmd_time is not None
+                    and time.monotonic() - self.last_cmd_time >= self.command_timeout):
+                self.get_logger().warning('Wheel command expired; requesting stop')
+                self.wheel_stop_requested = True
+            if self.wheel_stop_requested:
+                self._clear_wheel_command()
+                self.wheel.reset()
 
-        # 2-1. 設定時間戳記
-        self.joint_states.header.stamp = (self.get_clock().now().to_msg())
+            # Wheel stop cannot wait behind unrelated arm bus operations.
+            if self.torque_received and self.torque_data == 0:
+                self.arm_enabled = False
+                self.tool_received = self.joint_received = False
+                self.arm.set_torque(0)
+                self.torque_received = False
 
-        # 2-2. 填入七個關節的位置
-        self.joint_states.position = [
-            self.total_left,  # 左前輪
-            self.total_right,  # 右前輪
-            self.total_rear_left,  # 左後輪
-            self.total_rear_right,  # 右後輪
-            self.arm_states[0],  # 手臂關節 1
-            self.arm_states[1],  # 手臂關節 2
-            self.arm_states[2] ,  # 夾爪
-        ]
-  
-        # 2-3. 發布 JointState
-        self.joint_states_pub.publish(self.joint_states)
+            # 4. Process explicit enable requests without replaying stored commands.
+            # The operator must verify physical safety; these are ordinary ROS topics.
+            if self.wheel_torque_received:
+                self._clear_wheel_command()
+                self.wheel.reset()
+                self.wheel.set_torque(1)
+                self.wheel_enabled = True
+                self.wheel_torque_received = False
+            if self.torque_received:
+                self.tool_received = self.joint_received = False
+                self.arm.set_torque(1)
+                self.arm_enabled = True
+                self.torque_received = False
 
-        # 3：發布 /diff_rad
+            # 5. Process the latest valid tool, joint and wheel targets once.
+            if self.arm_enabled and self.tool_received:
+                self.arm.set_tool(self.tool_data)
+                self.tool_received = False
+            if self.arm_enabled and self.joint_received:
+                self.arm.set_joint(self.joint_data)
+                self.joint_received = False
+            if self.wheel_enabled and self.cmd_received:
+                # The preceding arm I/O may have consumed time; recheck freshness.
+                if time.monotonic() - self.last_cmd_time >= self.command_timeout:
+                    self._clear_wheel_command()
+                    self.wheel.reset()
+                else:
+                    self.wheel.set_wheel(self.cmd_data)
+                    self.cmd_received = False
 
-        # 3-1. 建立 Message
-        diff_msg = Float32MultiArray()
+            # 6. Read and validate actual feedback, not the commanded values.
+            # The motor firmware controls the actuator; these reads update ROS state.
+            self.fn_update_states()
 
-        # 3-2. 填入左、右輪角度差
-        diff_msg.data = [self.diff_left, self.diff_right]
+            # 7. Publish JointState with the original seven positions, in radians.
+            self.joint_states.header.stamp = self.get_clock().now().to_msg()
+            self.joint_states.position = self.total_wheel_rad + self.arm_states
+            self.joint_states_pub.publish(self.joint_states)
 
-        # 3-3. 發布 Message
-        self.diff_rad_pub.publish(diff_msg)
+            # 8. Publish the existing front-left/right angular-increment contract.
+            # Preserve the current odometry interface until the odom review.
+            diff_msg = Float32MultiArray()
+            diff_msg.data = self.diff_wheel_rad[:2]
+            self.diff_rad_pub.publish(diff_msg)
+        except Exception as exc:
+            # A failed operation must not publish fake feedback or replay commands.
+            # Latch the fault; do not automatically resume when communication returns.
+            self.faulted = True
+            self.arm_enabled = self.wheel_enabled = False
+            self._clear_motion_commands()
+            self.get_logger().error(f'Hardware/control fault: {exc}')
+            self._try_stop_wheels()
+            self.get_logger().warning('Arm motion/torque state is unverified; secure hardware manually')
 
-        # 4：處理夾爪命令
-        if self.tool_received:
-            self.arm.set_tool(self.tool_data)
-            self.tool_received = False
-
-        # 5：處理手臂關節命令
-        if self.joint_received:
-            self.arm.set_joint(self.joint_data)
-            self.joint_received = False
-
-        # 6：處理輪子速度命令
-        if self.cmd_received:
-            self.wheel.set_wheel(self.cmd_data)
-            self.cmd_received = False
-
-        # 7：處理 Reset 命令
-        if self.reset_received:
-            self.arm.reset()
-            self.wheel.reset()
-            self.reset_timer = self.create_timer(2.0, self.cb_flag)
-
-            self.reset_received = False
-
-        # 8：處理 Torque 命令
-        if self.torque_received:
-            self.arm.set_torque(self.torque_data)
-            self.torque_received = False
-
-
-    def cb_flag(self):
-        """
-        TODO: 將 state_is_reset 設為 False。
-        """
-        self.state_is_reset = False
-        self.reset_timer.cancel()
-        self.reset_timer.destroy()
-
-    # ── 功能函式 ────────────────────────────────────────────
+    # --- Feedback and lifecycle helpers ---
 
     def fn_update_states(self):
         """
-        TODO:
-        1. 從 arm.get_arm()   取得 arm_states
-        2. 從 wheel.get_wheel() 取得 wheel_states
-        3. 若 state_is_reset 為 False，將四個 last_* 初始化為當前讀值，
-           並設 state_is_reset = True
-        4. 對四個輪子分別計算：
-               diff  = (current - last) * XM_TICK2RAD
-               若 |diff| <= 2 * XM_TICK2RAD 則視為雜訊，設為 0
-               total += diff
-               更新 last
+        Teacher steps: read arm and wheel feedback, initialize last ticks on the
+        first sample, calculate increments, add to total, update last ticks.
         """
-        self.arm_states = self.arm.get_arm()
-        self.wheel_states = self.wheel.get_wheel()
-        
-        if self.state_is_reset == False:
+        arm = list(self.arm.get_arm())
+        wheels = list(self.wheel.get_wheel())
+        # Drivers validate communication; Base validates the full data contract
+        # before updating any accumulated state or publishing the sample.
+        if len(arm) != 3 or not all(math.isfinite(value) for value in arm):
+            raise ValueError('Expected three finite arm angles')
+        if len(wheels) != 4 or not all(
+            type(tick) is int and -(2**31) <= tick < 2**31 for tick in wheels
+        ):
+            raise ValueError('Expected four signed encoder tick values')
 
-            self.last_left = self.wheel_states[0]
-            self.last_right = self.wheel_states[1]
-            self.last_rear_left = self.wheel_states[2]
-            self.last_rear_right = self.wheel_states[3]
-            
-            self.state_is_reset = True
+        if self.last_wheel_ticks is None:
+            # First valid measurement establishes a reference, not a displacement.
+            self.diff_wheel_rad = [0.0] * 4
+        else:
+            # Preserve genuine small increments; the original 2-tick deadband
+            # discarded low-speed travel every time the last tick was updated.
+            self.diff_wheel_rad = [
+                encoder_delta(current, previous) * XM_TICK2RAD
+                for current, previous in zip(wheels, self.last_wheel_ticks)
+            ]
+            self.total_wheel_rad = [
+                total + diff for total, diff in zip(self.total_wheel_rad, self.diff_wheel_rad)
+            ]
+        self.last_wheel_ticks = wheels
+        self.arm_states = [float(value) for value in arm]
 
-        # 1. 計算左前輪本次角度差
-        self.diff_left = (self.wheel_states[0] - self.last_left) * XM_TICK2RAD
-        if abs(self.diff_left) <= 2 * XM_TICK2RAD:
-            self.diff_left = 0.0
-        self.total_left += self.diff_left
-        self.last_left = self.wheel_states[0]
+    def _clear_wheel_command(self):
+        """Discard a speed target so a reset, stop or enable cannot replay it."""
+        self.cmd_data = [0, 0]
+        self.cmd_received = False
+        self.wheel_stop_requested = False
+        self.last_cmd_time = None
 
-        # 2. 計算右前輪本次角度差
-        self.diff_right = (self.wheel_states[1] - self.last_right) * XM_TICK2RAD
-        if abs(self.diff_right) <= 2 * XM_TICK2RAD:
-            self.diff_right = 0.0
-        self.total_right += self.diff_right
-        self.last_right = self.wheel_states[1]  
-            
-        # 3. 計算左後輪本次角度差
-        self.diff_rear_left = (self.wheel_states[2] - self.last_rear_left) * XM_TICK2RAD
-        if abs(self.diff_rear_left) <= 2 * XM_TICK2RAD: 
-            self.diff_rear_left = 0.0
-        self.total_rear_left += self.diff_rear_left
-        self.last_rear_left = self.wheel_states[2]                     
+    def _clear_motion_commands(self):
+        """Invalidate pending arm and wheel movement during reset or faults."""
+        self._clear_wheel_command()
+        self.tool_received = self.joint_received = False
 
-        # 4. 計算右後輪本次角度差
-        self.diff_rear_right = (self.wheel_states[3] - self.last_rear_right) * XM_TICK2RAD
-        if abs(self.diff_rear_right) <= 2 * XM_TICK2RAD: 
-            self.diff_rear_right = 0.0
-        self.total_rear_right += self.diff_rear_right
-        self.last_rear_right = self.wheel_states[3]
+    def _try_cleanup(self, label, action):
+        """Attempt each cleanup action independently, even if another fails."""
+        try:
+            action()
+        except Exception as exc:
+            self.get_logger().error(f'{label} failed: {exc}')
 
-
+    def _try_stop_wheels(self):
+        """Best-effort requests; communication success is not physical stop proof."""
+        if self.wheel is not None:
+            self._try_cleanup('wheel stop', self.wheel.reset)
+            self._try_cleanup('wheel torque disable', lambda: self.wheel.set_torque(0))
 
     def fn_shutdown(self):
         """
-        TODO:
-        1. 印出 'Exiting ...'
-        2. 呼叫 arm.reset()
-        3. 呼叫 wheel.set_wheel([0, 0])
-        4. 等待 3 秒
-        5. 關閉 arm 與 wheel 的 torque
-        6. 關閉 dxl_port
+        Teacher shutdown tasks: log, stop wheels, handle torque and close the port.
+        Do not run the original automatic arm home or arbitrary 3-second sleep:
+        new motion during shutdown and elapsed time are not a verified safe state.
         """
-        print(f'Exiting ...')
-        self.arm.reset()
-        self.wheel.set_wheel([0, 0])
-        time.sleep(3)
-        self.arm.set_torque(0)
-        self.wheel.set_torque(0)
-        self.dxl_port.closePort()
+        if self.closed:
+            return
+        self.closed = True
+        self.arm_enabled = self.wheel_enabled = False
+        self._clear_motion_commands()
+        self.get_logger().info('Exiting: requesting wheel stop and closing the port')
+        if self.timer is not None:
+            self._try_cleanup('cancel timer', self.timer.cancel)
+        self._try_stop_wheels()
+        # Do not automatically remove arm holding torque: an unsupported arm
+        # can fall. Its physical state must be secured before power removal.
+        if self.arm is not None:
+            self.get_logger().warning('Arm torque unchanged; secure and verify arm state manually')
+        if self.dxl_port is not None:
+            self._try_cleanup('close port', self.dxl_port.closePort)
+        self.get_logger().info('Shutdown cleanup attempted')
 
-        print('Shutdown sequence completed')
 
-
-
-def main():
-    rclpy.init()
-    node = AICAR_BASE()
+def main(args=None):
+    """Initialize, spin and clean up the node even after partial startup failures."""
+    rclpy.init(args=args)
+    node = None
     try:
+        # Construction is inside try so ROS context cleanup still runs on failure.
+        node = AICAR_BASE()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.fn_shutdown()
-        node.destroy_node()
-        if rclpy.ok(): rclpy.shutdown()
+        try:
+            if node is not None:
+                try:
+                    node.fn_shutdown()
+                finally:
+                    node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == '__main__':
