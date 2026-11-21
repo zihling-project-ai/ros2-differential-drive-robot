@@ -1,308 +1,290 @@
 #!/usr/bin/env python3
 
-import sys, select, termios, tty, math, threading
+# Standard library and terminal keyboard input
+import math
+import select
+import sys
+import termios
+import threading
+import time
+import tty
 
+# ROS2 core and message types
 import rclpy
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
-from std_msgs.msg import *
+from std_msgs.msg import Empty, Int8, Int32, Int32MultiArray
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import JointState
 
-# ── 速度上限 ────────────────────────────────────────────────
+# Original operator limits (m/s, rad/s, degrees), not certified safety limits.
 MAX_LIN_VEL = 0.15
 MAX_ANG_VEL = 4.5
+MAX_J1, MIN_J1 = 90, 0
+MAX_J2, MIN_J2 = 90, 0
+MAX_TOOL, MIN_TOOL = 45, 0
 
-# ── 手臂角度範圍 (度) ───────────────────────────────────────
-MAX_J1 = 90;  MIN_J1 = 0
-MAX_J2 = 90;  MIN_J2 = 0
-MAX_TOOL = 45; MIN_TOOL = 0
+# Restore the teacher's gradual increments instead of jumping to full speed.
+STEP_LIN = 0.01
+STEP_ANG = 0.5
+STEP_ARM = 2
 
-# ── 每次按鍵的步進量 ────────────────────────────────────────
-STEP_LIN = 1
-STEP_ANG = 2.0
-STEP_ARM = 2.0
+# A short input lease limits stale keyboard targets; Base has its own watchdog.
+KEY_TIMEOUT_SEC = 0.3
+KEY_POLL_SEC = 0.1
+ARM_FEEDBACK_TIMEOUT_SEC = 0.5
+ARM_NAMES = ('arm_joint_1', 'arm_joint_2', 'tool_joint')
 
 msg = """
 Control Your AICAR!
 ----------------------------------------------
-Moving around:
+Moving around (repeat movement keys to continue):
             w(+)
    a(+)      s      d(-)
             x(-)
- 
+
 Arm control:
     Joint1 : u(+), j(-)
     Joint2 : i(+), k(-)
      Tool  : o(+), l(-)
- 
-h : Arm Home Pose
-s : force stop
- 
+
+h : request Arm Home Pose
+s : request wheel stop (not a hardware emergency stop)
+
+Motor enable/disable remains a separate explicit operation.
 CTRL-C to quit
 """
 
-def constrain(vel, max, min):
-    if vel < min: return min
-    if vel > max: return max
-    return vel
+
+def constrain(value, maximum, minimum):
+    return max(minimum, min(maximum, value))
 
 
 class AICAR_TELEOP(Node):
     def __init__(self):
         super().__init__('aicar_teleop')
 
+        # --- State: the keyboard and ROS callbacks share these targets ---
+        self.lock = threading.Lock()
+        self.lin_vel = self.ang_vel = 0.0
+        self.last_wheel_key = None
+        self.get_arm_data = False
+        self.last_arm_received = None
+        self.last_arm_stamp_ns = None
+        self.arm_cutoff_ns = None
+        self.j1 = self.j2 = self.tool = 0
+
         # --- Subscribers ---
-        # TODO: 建立以下兩個 Subscriber，綁定對應的 callback
-        #   /joint_states  (JointState) → cb_joint_states
-        #   /reset         (Empty)      → cb_reset
-        
-        self.joint_states_sub = self.create_subscription(JointState, '/joint_states',self.cb_joint_states, 10)
+        self.joint_states_sub = self.create_subscription(JointState, '/joint_states', self.cb_joint_states, 10)
         self.reset_sub = self.create_subscription(Empty, '/reset', self.cb_reset, 10)
-        
-        # --- Publishers ---
-        # TODO: 建立以下三個 Publisher
-        #   /cmd_vel  (Twist)           queue=1  → self.cmd_pub
-        #   /joint      (Int32MultiArray) queue=1  → self.joint_pub
-        #   /tool     (Int32)           queue=1  → self.tool_pub
-        
-        self.cmd_pub  = self.create_publisher(Twist, '/cmd_vel', 1)
-        self.joint_pub  = self.create_publisher(Int32MultiArray, '/joint', 1)
+        # Observe explicit enable/disable requests only to discard old targets.
+        # Receiving a request does not prove that the physical torque has changed.
+        self.arm_torque_sub = self.create_subscription(Int8, '/torque', self.cb_arm_torque, 10)
+        self.wheel_torque_sub = self.create_subscription(Int8, '/wheel_torque', self.cb_wheel_torque, 10)
+
+        # --- Publishers: retain original command types and topics ---
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 1)
+        self.joint_pub = self.create_publisher(Int32MultiArray, '/joint', 1)
         self.tool_pub = self.create_publisher(Int32, '/tool', 1)
 
-        # --- 狀態變數 ---
-        self.lin_vel = self.ang_vel = 0.0
-        self.get_arm_data = False
-        self.j1 = self.j2 = self.tool = 0
-
-        self.settings = termios.tcgetattr(sys.stdin)
-
-    # ── Subscriber Callbacks ────────────────────────────────
-
+    # --- Subscriber callbacks ---
     def cb_joint_states(self, msg):
-        """
-        TODO: 只在 get_arm_data 為 False 時處理：
-        1. 從 msg.position[4~6] 讀取弧度值，換算成整數角度（* 180 / pi）
-           分別存入 self.j1, self.j2, self.tool
-        2. 印出 '[ ARM ] init : j1=..., j2=..., tool=...'
-        3. 設定 get_arm_data = True
-        """
-        if not self.get_arm_data:
-            if len(msg.position) < 7:
+        """Initialize targets from fresh named joints, not fixed array indexes."""
+        with self.lock:
+            now = time.monotonic()
+            ros_now = self.get_clock().now().nanoseconds
+            stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+            # If ROS time moves backwards, require a new measured baseline.
+            if ((self.last_arm_stamp_ns is not None and ros_now < self.last_arm_stamp_ns) or
+                    (self.arm_cutoff_ns is not None and ros_now < self.arm_cutoff_ns)):
+                self.arm_cutoff_ns = None
+                self.last_arm_stamp_ns = None
+                self.get_arm_data = False
+            if (len(msg.name) != len(msg.position) or len(set(msg.name)) != len(msg.name) or
+                    stamp <= 0 or not 0.0 <= (ros_now - stamp) / 1e9 <= ARM_FEEDBACK_TIMEOUT_SEC or
+                    (self.arm_cutoff_ns is not None and stamp <= self.arm_cutoff_ns) or
+                    (self.last_arm_stamp_ns is not None and stamp <= self.last_arm_stamp_ns)):
                 return
+            positions = dict(zip(msg.name, msg.position))
+            if not all(name in positions and math.isfinite(positions[name]) for name in ARM_NAMES):
+                return
+            # Only the initial/recovered sample establishes targets; do not overwrite
+            # a user target with the moving arm's instantaneous actual position.
+            degrees = [math.degrees(positions[name]) for name in ARM_NAMES]
+            if not all(math.isfinite(value) for value in degrees):
+                return
+            angles = [round(value) for value in degrees]
+            if not all(low <= value <= high for value, low, high in
+                       zip(angles, (MIN_J1, MIN_J2, MIN_TOOL), (MAX_J1, MAX_J2, MAX_TOOL))):
+                self.get_arm_data = False
+                self.last_arm_received = None
+                return
+            if not self._arm_feedback_fresh(now):
+                self.j1, self.j2, self.tool = angles
+                self.get_arm_data = True
+                self.get_logger().info(f'[ ARM ] sync: {self.j1}, {self.j2}, {self.tool}')
+            self.last_arm_received = now
+            self.last_arm_stamp_ns = stamp
 
-            self.j1 = int(math.degrees(msg.position[4]))
-            self.j2 = int(math.degrees(msg.position[5]))
-            self.tool = int(math.degrees(msg.position[6]))
+    def _arm_feedback_fresh(self, now):
+        if not self.get_arm_data or self.last_arm_received is None or self.last_arm_stamp_ns is None:
+            return False
+        age = (self.get_clock().now().nanoseconds - self.last_arm_stamp_ns) / 1e9
+        return (0.0 <= age <= ARM_FEEDBACK_TIMEOUT_SEC and
+                0.0 <= now - self.last_arm_received <= ARM_FEEDBACK_TIMEOUT_SEC)
 
-            self.get_logger().info(
-                f'[ ARM ] init : '
-                f'j1={self.j1}, '
-                f'j2={self.j2}, '
-                f'tool={self.tool}'
-            )
-
-            self.get_arm_data = True
+    def _invalidate_arm(self):
+        # Reject queued pre-reset/enable feedback; wait for an actual new sample.
+        self.get_arm_data = False
+        self.last_arm_received = self.last_arm_stamp_ns = None
+        self.arm_cutoff_ns = self.get_clock().now().nanoseconds
 
     def cb_reset(self, msg):
-        """
-        TODO:
-        1. 印出 '[ SET ] TELEOP reset'
-        2. 將 j1, j2, tool, lin_vel, ang_vel 全部歸零。
-        """
-        self.get_logger().info(f'[ SET ] TELEOP reset')
-        self.j1 = self.j2 = self.tool = 0
-        self.lin_vel = self.ang_vel = 0.0
+        """Stop wheel targets and request a new arm baseline, not a home pose."""
+        with self.lock:
+            self._stop_wheels()
+            self._invalidate_arm()
+            self.get_logger().info('[ SET ] TELEOP reset')
 
-    # ── 功能函式 ────────────────────────────────────────────
+    def cb_arm_torque(self, msg):
+        if msg.data in (0, 1):
+            with self.lock:
+                self._invalidate_arm()
 
+    def cb_wheel_torque(self, msg):
+        if msg.data in (0, 1):
+            with self.lock:
+                # Clear pending targets without publishing a competing command.
+                self.last_wheel_key = None
+                self.lin_vel = self.ang_vel = 0.0
+
+    # --- Terminal and command publication ---
     def fn_get_key(self):
+        """Return one key, an empty timeout, or None on terminal EOF."""
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
-
         try:
             tty.setraw(fd)
-
-            ready, _, _ = select.select(
-                [sys.stdin], [], [], 0.1
-            )
-
+            ready, _, _ = select.select([sys.stdin], [], [], KEY_POLL_SEC)
             if ready:
-                key = sys.stdin.read(1)
-                return key
-
+                return sys.stdin.read(1) or None
             return ''
-
         finally:
-            termios.tcsetattr(
-                fd,
-                termios.TCSADRAIN,
-                old_settings
-            )
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def fn_wheel_pub(self):
-        """
-        TODO:
-        1. 印出 '[ WHEEL ] linear : %.2f, angular : %.2f'
-        2. 建立 Twist 訊息，填入 lin_vel / ang_vel 並發布
-        """
-        self.get_logger().info(
-        f'[ WHEEL ] linear : {self.lin_vel:.2f}, '
-        f'angular : {self.ang_vel:.2f}'
-        )
-
+        # Publish desired body velocity; Base alone handles motor commands.
         cmd = Twist()
-
         cmd.linear.x = float(self.lin_vel)
         cmd.angular.z = float(self.ang_vel)
-
         self.cmd_pub.publish(cmd)
 
+    def fn_arm_pub(self, joint=False, tool=False):
+        # Send only the requested group; only an explicit home requests both.
+        if joint:
+            joint_msg = Int32MultiArray()
+            joint_msg.data = [self.j1, self.j2]
+            self.joint_pub.publish(joint_msg)
+        if tool:
+            tool_msg = Int32()
+            tool_msg.data = self.tool
+            self.tool_pub.publish(tool_msg)
 
-    def fn_arm_pub(self):
-        """
-        TODO:
-        1. 印出 '[  ARM  ] j1 : %d, j2 : %d, tool : %d'
-        2. 建立 Int32MultiArray，填入 [j1, j2] 並發布到 /joint
-        3. 建立 Int32，填入 tool 並發布到 /tool
-        """
-        self.get_logger().info(
-            f'[ ARM ] j1 : {int(self.j1)}, '
-            f'j2 : {int(self.j2)}, '
-            f'tool : {int(self.tool)}'
-        )
+    def _stop_wheels(self):
+        self.lin_vel = self.ang_vel = 0.0
+        self.last_wheel_key = None
+        self.fn_wheel_pub()
 
-        joint_msg = Int32MultiArray()
-        joint_msg.data = [
-            int(self.j1),
-            int(self.j2)
-        ]
-
-        tool_msg = Int32()
-        tool_msg.data = int(self.tool)
-
-        self.joint_pub.publish(joint_msg)
-        self.tool_pub.publish(tool_msg)
-
-
-    def fn_run(self):
-        """
-        TODO: 主鍵盤控制迴圈
-        1. 印出操作說明 msg
-        2. 進入 while True 迴圈，每次呼叫 fn_get_key() 取得按鍵
-        3. 根據按鍵對應的動作（參考 msg 說明）：
-               w / x  → lin_vel ± STEP_LIN，呼叫 fn_wheel_pub()
-               a / d  → ang_vel ± STEP_ANG，呼叫 fn_wheel_pub()
-               u / j  → j1      ± STEP_ARM，呼叫 fn_arm_pub()
-               i / k  → j2      ± STEP_ARM，呼叫 fn_arm_pub()
-               o / l  → tool    ± STEP_ARM，呼叫 fn_arm_pub()
-               h      → j1=j2=tool=0，呼叫 fn_arm_pub()
-               s      → lin_vel=ang_vel=0.0，呼叫 fn_wheel_pub()
-               CTRL-C ('\x03') → 跳出迴圈
-           每個有效按鍵讓 status += 1；status 達到 20 時重新印出 msg 並歸零
-        4. finally 區塊：停止車輪並還原終端機設定
-        """
-        print(msg)
-        try:
-            while True:
-                key = self.fn_get_key().lower()
-                if key:print(f'[KEY DEBUG] {repr(key)}', flush=True)
+    def _handle_key(self, key):
+        """Process one input event and refresh only a still-valid wheel target."""
+        with self.lock:
+            now = time.monotonic()
+            # Expire before processing a new key; do not inherit an old target.
+            if self.last_wheel_key is not None and now - self.last_wheel_key >= KEY_TIMEOUT_SEC:
+                self._stop_wheels()
+            if key == 's':
+                self._stop_wheels()
+                return
+            if key in ('w', 'x', 'a', 'd'):
+                # Move by the teacher's increments; only wheel keys renew the lease.
                 if key == 'w':
-                    print(f"前進")
                     self.lin_vel = constrain(self.lin_vel + STEP_LIN, MAX_LIN_VEL, -MAX_LIN_VEL)
-                    self.fn_wheel_pub()
-
                 elif key == 'x':
-                    print(f"後退")
                     self.lin_vel = constrain(self.lin_vel - STEP_LIN, MAX_LIN_VEL, -MAX_LIN_VEL)
-                    self.fn_wheel_pub()
-
                 elif key == 'a':
-                    print("turn left")
                     self.ang_vel = constrain(self.ang_vel + STEP_ANG, MAX_ANG_VEL, -MAX_ANG_VEL)
-                    self.fn_wheel_pub()
-
-                elif key == 'd':
-                    print("turn right")
+                else:
                     self.ang_vel = constrain(self.ang_vel - STEP_ANG, MAX_ANG_VEL, -MAX_ANG_VEL)
-                    self.fn_wheel_pub()
-                
-                # Joint 1：u 增加、j 減少
-                elif key == 'u':
-                    self.j1 = constrain(self.j1 + STEP_ARM, MAX_J1, MIN_J1)
-                    self.fn_arm_pub()
-
-                elif key == 'j':
-                    self.j1 = constrain(self.j1 - STEP_ARM, MAX_J1, MIN_J1)
-                    self.fn_arm_pub()
-
-                # Joint 2：i 增加、k 減少
-                elif key == 'i':
-                    self.j2 = constrain(self.j2 + STEP_ARM, MAX_J2, MIN_J2)
-                    self.fn_arm_pub()
-
-                elif key == 'k':
-                    self.j2 = constrain(self.j2 - STEP_ARM, MAX_J2, MIN_J2)
-                    self.fn_arm_pub()
-
-                # Tool：o 增加、l 減少
-                elif key == 'o':
-                    self.tool = constrain(self.tool + STEP_ARM, MAX_TOOL, MIN_TOOL)
-                    self.fn_arm_pub()
-
-                elif key == 'l':
-                    self.tool = constrain(self.tool - STEP_ARM, MAX_TOOL, MIN_TOOL)
-                    self.fn_arm_pub()
-
-                # h：手臂回到 Home Position
+                self.last_wheel_key = now
+            elif key in ('u', 'j', 'i', 'k', 'o', 'l', 'h'):
+                # Require fresh measured feedback before issuing an arm target.
+                if not self._arm_feedback_fresh(now):
+                    self.get_arm_data = False
+                    self.get_logger().warning('Waiting for fresh arm feedback', throttle_duration_sec=1.0)
                 elif key == 'h':
                     self.j1 = self.j2 = self.tool = 0
-                    self.fn_arm_pub()
+                    self.fn_arm_pub(joint=True, tool=True)
+                elif key in ('u', 'j'):
+                    self.j1 = constrain(self.j1 + (STEP_ARM if key == 'u' else -STEP_ARM), MAX_J1, MIN_J1)
+                    self.fn_arm_pub(joint=True)
+                elif key in ('i', 'k'):
+                    self.j2 = constrain(self.j2 + (STEP_ARM if key == 'i' else -STEP_ARM), MAX_J2, MIN_J2)
+                    self.fn_arm_pub(joint=True)
+                else:
+                    self.tool = constrain(self.tool + (STEP_ARM if key == 'o' else -STEP_ARM), MAX_TOOL, MIN_TOOL)
+                    self.fn_arm_pub(tool=True)
 
-                # s：車輪停止
-                elif key == 's':
-                    self.lin_vel = self.ang_vel = 0.0
-                    self.fn_wheel_pub()
-
-                # Ctrl+C：離開迴圈
-                elif key == '\x03':
-                    break
-        
-        finally:
-            self.lin_vel = 0.0
-            self.ang_vel = 0.0
-
-            try:
+            # Refresh a bounded user input lease, never a latched old velocity.
+            if self.last_wheel_key is not None:
                 self.fn_wheel_pub()
+
+    def fn_run(self):
+        """Teacher steps: show controls, read keys, publish, stop and restore terminal."""
+        if not sys.stdin.isatty():
+            raise RuntimeError('Teleop requires an interactive terminal')
+        settings = termios.tcgetattr(sys.stdin)
+        print(msg)
+        try:
+            while rclpy.ok():
+                key = self.fn_get_key()
+                if key is None or key == '\x03':
+                    break
+                # Do not lowercase escape-sequence bytes (e.g. arrow-key 'A').
+                self._handle_key(key)
+        finally:
+            try:
+                with self.lock:
+                    self._stop_wheels()
             finally:
-                termios.tcsetattr(
-                    sys.stdin,
-                    termios.TCSADRAIN,
-                    self.settings
-                )
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
 
 
-
-def main():
-    rclpy.init()
-    node = AICAR_TELEOP()
-
-    # 用 MultiThreadedExecutor 在背景執行 spin，讓主執行緒跑鍵盤迴圈
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
-    spin_thread.start()
-
+def main(args=None):
+    rclpy.init(args=args)
+    node = executor = spin_thread = None
     try:
+        node = AICAR_TELEOP()
+        # One background executor handles callbacks; the main thread reads keys.
+        executor = SingleThreadedExecutor()
+        executor.add_node(node)
+        spin_thread = threading.Thread(target=executor.spin)
+        spin_thread.start()
         node.fn_run()
+    except KeyboardInterrupt:
+        pass
     finally:
-        executor.shutdown()
-        spin_thread.join(timeout=2.0)
-
-        node.destroy_node()
-
-    if rclpy.ok():
-        rclpy.shutdown()
+        try:
+            if executor is not None:
+                executor.shutdown()
+            if spin_thread is not None and spin_thread.ident is not None:
+                spin_thread.join()
+        finally:
+            try:
+                if node is not None:
+                    node.destroy_node()
+            finally:
+                if rclpy.ok():
+                    rclpy.shutdown()
 
 
 if __name__ == '__main__':
