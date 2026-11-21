@@ -1,80 +1,87 @@
-# 03 — 網路拓撲、單／雙網卡與 SSH
+# 03 — 網路架構、無線部署與有線診斷
 
-> **狀態：** 雙網卡有線直連在 2026-11-20 **PASS**；原學校網路方案過去曾可用，但本輪**未復現**。  
-> **前提：** 機器人已通電，網路線接妥；不修改正在承載 SSH 的 `br0`／`eth0`。
+> **工程目標：** 建立可供移動機器人與開發端互通的網路，並在無線連線尚未建立時保留獨立的診斷路徑。
+>
+> **驗證基準：** 2026-11-20；無線方案曾可用，但此次未復現；雙網卡有線直連的網路與 SSH 已通過當輪測試，並非實地移動部署的驗收。
 
-## 3.1 兩種連線模型
+## 3.1 方案選擇：無線為主、有線為備援測試
 
-### 方案 A：開發主機雙網卡、有線直連（本輪 PASS）
+| 方案 | 工程用途 | 設計取捨 | 驗證狀態 |
+| --- | --- | --- | --- |
+| A：無線 Wi-Fi | 實地移動與跨主機操作 | 車體不受網路線限制；需要有效 Wi-Fi、IP 配置、相互可達性及場域覆蓋 | 歷史可用，本輪未復現 |
+| B：雙網卡、有線直連 | 建置、無線無 IP 時的診斷與隔離驗收 | 可保留開發端上網，同時建立獨立車端網段；網路線限制車體移動 | 2026-11-20 網路與 SSH 驗收通過 |
 
-```text
-學校 LAN / Internet
-10.117.1.0/24, gateway 10.117.1.1
-    │
-Windows 11 / WSL2 LV333-06
-    ├── 乙太網路 / WSL eth1：10.117.1.231/24 → Internet
-    └── 乙太網路 2 / WSL eth0：192.168.123.2/24（不設 gateway）
-                                      │ Ethernet
-                                      ▼
-Raspberry Pi car06：br0 192.168.123.1/24（eth0 為 bridge 成員）
-```
+**設計判斷：** AICAR 是移動機器人，因此 Wi-Fi 是後續實地場域的目標方案。雙網卡不是正式運行的必要條件，也不代表必須讓車輛長期連接網路線。它的價值在於當 Wi-Fi 無法取得 IP、無法 SSH 或無法辨識故障時，仍能使用另一條已驗證的路徑檢查網路與軟體。此有線模式僅用於適當的靜止或隔離測試，不把連線成功當作實車運行驗收。
 
-本機同時具備兩條直連網段路由。`192.168.123.1` 的封包經 `eth0`；其他外網流量由 default gateway `10.117.1.1` 經 `eth1` 送出。不需要把車端設成 Internet Gateway。
+## 3.2 網路拓撲與路由
 
-在 Windows 11 以 `Win + R` → `ncpa.cpl` 找到連車端的**第二張實體網卡**，配置 IPv4：
-
-| 欄位 | 乙太網路 2 |
-|---|---|
-| IPv4 | `192.168.123.2` |
-| Subnet mask | `255.255.255.0` |
-| Default gateway | **留空** |
-| DNS | **留空** |
-
-學校網路原本的 IP/DHCP/Gateway 不要變更。本輪「乙太網路 2」另曾有 `192.168.1.6/24` 位址，是否保留應由原網路用途決定；不得未經核對任意刪除。
-
-### 方案 B：原本共用學校網段（歷史可用）
+### 方案 A：Wi-Fi（目標部署）
 
 ```text
-學校 LAN 10.117.1.0/24 ── Internet
-       ├── Windows/WSL2 單張上網網卡：舊 10.117.1.28、現 10.117.1.231
-       └── car06：舊 10.117.1.196（歷史紀錄，非目前有效 IP）
+              授權的區域網路 / Wi-Fi AP
+                  ├── 開發主機 dev-host（IP3）
+                  └── Raspberry Pi robot-host（IP5，Wi-Fi）
 ```
 
-單一網卡同時連車端與 Internet 沒有衝突：同子網 IP 的流量透過本地鏈路；其他流量經預設閘道。方案 B 是否可用取決於 Raspberry Pi 是否能連到同一個允許互通的學校網路，以及 AP/交換設備與防火牆策略。**不要固定假設 DHCP 會永遠分配 `10.117.1.196`。**
+開發主機可以經有線或無線加入同一個允許互通的網路；車端透過 `wlan0` 取得有效位址，不必與開發主機有實體線材連接。`IP5` 為本篇新增的車端 Wi-Fi 位址代稱，通常由 DHCP 分配；重新連線時須核對當前值，不將歷史位址視為永久設定。若場域允許，也可評估獨立的授權無線 AP，而非依賴共享網路。
 
-## 3.2 IP 與路由檢查
+無線網路適用於移動場域，但必須驗證 AP 覆蓋、設備互通策略、防火牆、通訊延遲及中斷行為；有效 IP 或成功 SSH 不代表移動時 ROS2 資料及控制延遲已符合要求。網路失聯也不應使實車依賴過期控制命令，獨立安全保護需另外驗收。
 
-Windows PowerShell：
+### 方案 B：有線診斷（已驗證的備援測試路徑）
 
-```powershell
-ipconfig
-ping 192.168.123.1
-Test-NetConnection 192.168.123.1 -Port 22
+```text
+授權上網網路
+       │
+dev-host / Windows 11 + WSL2
+       ├── 上網介面 IP3 → 原有預設閘道
+       └── 專用 Ethernet IP1（不設預設閘道）
+                              │ Ethernet
+                              ▼
+                     robot-host：br0 IP2
+                     （eth0 為 bridge 成員）
 ```
 
-WSL2：
+`IP1` 與 `IP2` 遵循 [01](01-os-hosts.md) 所定義的專用車端網段角色，應位於同一個獲准且不與上網網段重疊的子網。開發主機原本上網介面的 DHCP、預設閘道及 DNS 保留；專用車端網卡僅負責該子網。
+
+| 專用開發端網卡設定 | 原則 |
+| --- | --- |
+| IPv4 | `IP1`，與車端 `IP2` 同網段 |
+| 子網遮罩 | 與車端網段相符；歷史測試使用 `/24` |
+| Default gateway | 留空 |
+| DNS | 不另設 |
+
+這樣路由會將車端封包經專用 Ethernet 傳送，其他流量仍依開發端原有預設路由；不需要將車端設為 Internet Gateway。使用現有橋接介面時不得任意修改承載 SSH 的 `br0`／`eth0`；若還有其他介面位址 `IP4`，先確認其用途，不直接刪除。
+
+## 3.3 連線驗收與故障判斷
+
+依實際方案使用 `IP5`（無線）或 `IP2`（有線）替換目標位址；以下代稱不是可直接執行的實際 IP。只對獲准管理的車端設備進行檢查。
 
 ```bash
+# WSL2 / Linux: inspect the selected network path
 ip -br -4 addr
 ip -4 route
-ip -4 route get 192.168.123.1
-ping -c 4 192.168.123.1
-ip neigh show 192.168.123.1
+ip -4 route get IP2
+ping -c 4 IP2
 ```
 
-本輪實測：
-
-```text
-192.168.123.1 dev eth0 src 192.168.123.2
-4 packets transmitted, 4 received, 0% packet loss
-TcpTestSucceeded : True
+```powershell
+# Windows: check the vehicle endpoint and SSH service
+ipconfig
+Test-NetConnection IP2 -Port 22
 ```
 
-舊 `10.117.1.196` 曾出現 `Destination Host Unreachable`、鄰居解析 `FAILED`；Windows Ping 統計顯示「收到 4」但都是 ICMP 不可達訊息，**不代表 Ping 成功**。
+| 檢查層級 | 判斷方式 |
+| --- | --- |
+| Link／Wi-Fi | 車端介面是否已連線 |
+| IP／Routing | 有效 IP、子網及到達目標的網路路徑 |
+| ICMP／TCP | Ping 及 SSH TCP 22 的可達性 |
+| Application | SSH、ROS2 雙向 Topic、時鐘同步及資料品質 |
 
-## 3.3 Raspberry Pi 介面與 Netplan
+**已驗證證據（2026-11-20，有線路徑）：** 實測路由顯示車端目標由專用介面及開發端專用位址送出（代稱 `IP2 dev eth0 src IP1`）；Ping 4 次均成功、0% packet loss；Windows TCP 22 驗證為 `TcpTestSucceeded: True`，SSH 後確認登入車端。在共用網路路徑上，歷史車端位址曾出現 `Destination Host Unreachable`，鄰居解析 `FAILED`；收到 ICMP 不可達回覆不等於 Ping 成功。
 
-車端唯讀檢查：
+## 3.4 Wi-Fi 未取得 IP 時的診斷
+
+在車端或已建立的有線診斷連線中執行唯讀檢查：
 
 ```bash
 ip -br link
@@ -82,81 +89,43 @@ ip -br -4 addr
 ip -4 route
 networkctl list --no-pager
 networkctl status wlan0 --no-pager
-ls -1 /etc/netplan/
 ```
 
-本輪狀態：
+若需要確認 Wi-Fi 連線狀態，在獲准管理的設備上查閱 `wpa_cli -i wlan0 status` 或相關 systemd 日誌；不要將包含 SSID、認證資料或其他設備識別資訊的完整輸出放入公開文件。
 
-| 介面 | 觀察 |
-|---|---|
-| `eth0` | `UP`、`LOWER_UP`，`networkctl` 為 `enslaved` |
-| `br0` | `192.168.123.1/24`，`routable` |
-| `wlan0` | `NO-CARRIER`，無 IPv4 |
-| IPv4 routes | 僅 `192.168.123.0/24 dev br0`，無 default route |
+| 既有觀測 | 工程判斷 |
+| --- | --- |
+| `eth0` 已連線且為 bridge 成員、`br0` routable | 有線診斷路徑可用 |
+| `wlan0` 為 `NO-CARRIER`，無 IPv4 | Wi-Fi 當時未建立有效連線，不是 ROS2 問題 |
+| `wpa_state=SCANNING`，可見其他 AP 但找不到預期的授權 SSID | 尚無法確認當時的 Wi-Fi 失敗原因，不足以證明密碼錯誤或硬體損壞 |
+| 車端僅有專用子網路由，無預設路由 | 有線診斷可達，但不能因此推定 Internet 可用 |
 
-`/etc/netplan/50-cloud-init.yaml` 使用 `renderer: networkd`：`br0` 包含 `eth0` 並固定 `192.168.123.1/24`；`wlan0` 則設定 DHCP 連線到原教學 SSID `idm-wifi`。**此檔含認證資訊，不能直接貼到公開文件或 Git。**
+設備原先以 `systemd-networkd`／Netplan 管理網路，`nmcli` 不存在不代表網路管理故障。實際 Netplan 可能包含 Wi-Fi 認證，不能原封不動提交 Git。只有獲授權的無線環境及其管理資料確認後，才能重新驗證 Wi-Fi；不得以附近其他 AP 或歷史 DHCP 位址替代。
 
-`nmcli` 不存在並不代表網路管理故障；現場採 `systemd-networkd` 而非 NetworkManager。
+## 3.5 SSH 作為開發與診斷介面
 
-## 3.4 原學校 Wi-Fi 排障紀錄（方案 B 未復現）
-
-```bash
-# Raspberry Pi，唯讀／不變更網路配置
-sudo wpa_cli -i wlan0 status
-sudo wpa_cli -i wlan0 list_networks
-sudo wpa_cli -i wlan0 scan_results
-systemctl status netplan-wpa-wlan0.service --no-pager -l
-sudo journalctl -u netplan-wpa-wlan0.service -b -n 40 --no-pager
-```
-
-本輪觀察：`wpa_state=SCANNING`、`netplan-wpa-wlan0.service=active`，掃描能找到其他 2.4/5 GHz AP，但找不到原設定的 `idm-wifi`；Log 重複出現 `Failed to initiate sched scan`。此情況**不能直接證明**密碼錯誤、Wi-Fi 硬體損壞或驅動不相容。也可能是 AP 不在涵蓋範圍、SSID 已變更或被隱藏。
-
-未獲學校網路管理員提供允許使用的 SSID 與連線方式前，不要改連附近其他 AP；不要為了測試單網卡而覆蓋可用的 `br0` 設定。
-
-## 3.5 SSH 與 VS Code Remote-SSH
-
-**WSL2 Terminal 連車端：**
+SSH 能證明在目前網路及授權帳號下可進入車端 Linux，但不等於 ROS2 控制或導航已正常運作。
 
 ```bash
-ssh ubuntu@192.168.123.1
-# 成功後應看到 ubuntu@car06:~$
+# Replace IP2 with the currently verified authorized vehicle address.
+ssh robot-user@IP2
+# On the remote host:
 whoami
 hostname
-hostname -I
 ```
 
-SSH 初次連線需人工核對 **ED25519 Host Key Fingerprint** 與可信的車端資料後接受；登入密碼為車端 `ubuntu` 的密碼，並非 WSL `zihling` 的密碼。登入 `ubuntu@car06` 後再執行 `ssh ubuntu@192.168.123.1` 會形成車端連自己，無須這麼做。
+首次連線前應核對車端 Host Key Fingerprint；帳號為車端 Linux 帳號，與 Windows、WSL2 本機帳號各自獨立。VS Code 遠端開發設定見 [02](02-ros2-workspace.md)，不需在本篇重複操作流程。
 
-**Windows VS Code 遠端連線：**
+## 3.6 實地無線部署的驗收計畫
 
-```sshconfig
-# Windows: C:\Users\<WindowsUser>\.ssh\config
-Host aicar-ethernet
-    HostName 192.168.123.1
-    User ubuntu
+| 驗收項目 | 目前狀態 |
+| --- | --- |
+| Wi-Fi 授權連線、有效 IP 與場域覆蓋 | 待復驗 |
+| 無線路徑 Ping、SSH | 歷史可用，本輪未復現 |
+| 無線 ROS2／Zenoh 雙向 Topic 與校時 | 待完整驗證；見 [04](04-zenoh-firewall.md)、[05](05-time-sync.md) |
+| 場域內通訊延遲、失聯及獨立保護 | 待實際測量與安全驗收 |
+| 無線無 IP 時的有線診斷 | 已驗證（2026-11-20 的網路與 SSH） |
 
-Host aicar-campus
-    HostName <當次查證有效的車端學校網路 IP>
-    User ubuntu
-```
-
-Windows VS Code `Ctrl+Shift+P` → `Remote-SSH: Connect to Host...` → 選擇 `aicar-ethernet` → Linux → Open Folder `/home/ubuntu/ros2_ws`。本機 VS Code 保留獨立 WSL 視窗開啟 `/home/zihling/ros2_ws`。
-
-### SSH 能連但 VS Code 無法啟動
-
-- 檢查 Windows 的 SSH Config 是否仍指向失效 IP。
-- 由 WSL SSH 登入車端後檢查 `bash -n ~/.bashrc`。
-- 本輪曾因 `.bashrc` 的 Zenoh `export` 行尾多一個雙引號而出現 `unexpected EOF`；修正後恢復遠端開發。
-- Remote-SSH 連線後若卡在 VS Code Server 安裝，從 `Remote-SSH: Show Log` 辨認下載、遠端 Shell 或磁碟空間問題。
-- WSL 與 Windows SSH Client 可能有不同的 `known_hosts`／金鑰，不可直接假設兩者共享登入狀態。
-
-## 3.6 方案 B 的恢復驗收條件
-
-1. 合法學校網路可供 car06 連線；`wlan0` 出現有效 `10.117.1.x` IP。
-2. 從本機的學校網卡對車端新 IP 完成 Ping、SSH 驗證。
-3. Zenoh Client 改指向本機**當次**學校網卡 IP 的 TCP 7447，重新檢查防火牆與雙向 Topic。
-4. 跨主機時間同步來源亦須可達；不能因網路切換而保留已失效的固定 NTP 位址。
-
-本輪沒有恢復 `idm-wifi`，所以方案 B 只能標記「歷史成功／待復驗」。
+最終目標是在無需長期網路線的情況下，取得可驗證的無線通訊；網路切換後必須重新核對實際 Router 與時鐘來源。此文件不將有線或無線 SSH 的成功宣稱為導航或馬達安全的通過。
 
 **接續：** [04 — Zenoh Router 與防火牆](04-zenoh-firewall.md)。
