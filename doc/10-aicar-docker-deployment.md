@@ -1,8 +1,8 @@
 # 10｜AICAR 跨環境部署與 Docker
 
-更新日期：2026-11-21　｜　狀態：規劃／尚未建置或驗收
+更新日期：2026-11-21　｜　狀態：AMD64 CI 驗證通過；Mac ARM64 與映像搬移待驗證
 
-Repository 已加入 `docker/Dockerfile` 及 `.github/workflows/ci.yml` 的基礎版本。CI 目標為靜態檢查、建立最小 Jazzy Image、隔離容器內 `colcon build` 和 Package Discoverability，不執行實車、硬體測試或自動部署。此版本不保證所有硬體、視覺、導航與 Gazebo 相依已完整安裝。
+Repository 的 `docker/Dockerfile` 與 `.github/workflows/ci.yml` 已驗證：Python/XML 靜態檢查、79 項離線測試、AMD64 Jazzy Image 建置、隔離容器內 `colcon build`、Package Discoverability 與四個假硬體 ROS2 smoke test。CI 不連接實車、不執行硬體診斷或自動部署。此映像不包含完整的實車 SDK、I²C、視覺、導航與 Gazebo 執行環境。
 
 ## 1. 目標
 
@@ -20,7 +20,7 @@ Docker 可降低套件版本差異，但不能解決所有 CPU、圖形加速、
 
 統一基準：Ubuntu 24.04 Noble、ROS2 Jazzy、Gazebo Harmonic（選配）、RViz2（選配）、Zenoh（選配）。ROS 官方 `ros:jazzy-ros-base` 支援 AMD64 與 ARM64；Gazebo Harmonic 的 ARM 平台支援與圖形效能須單獨驗證。
 
-## 3. 學會 Docker 的四個概念
+## 3. 容器與版本管理
 
 | 名稱 | 意思 | AICAR 的例子 |
 | --- | --- | --- |
@@ -29,16 +29,16 @@ Docker 可降低套件版本差異，但不能解決所有 CPU、圖形加速、
 | Container | Image 的運行實例 | 開啟 shell 執行 ROS2 測試 |
 | Bind mount | 讓容器讀取主機資料夾 | 在 Mac 編輯程式，容器建置 |
 
-建議把 Dockerfile、Compose 定義及源碼放 GitHub；映像檔是可匯入匯出的建置產物。只帶回 tar 映像並不等於帶回完整 Workspace：volume、bind mount、未提交的變更都需另行備份。
+Dockerfile、CI 與源碼由 Git 管理；映像檔是可匯入匯出的建置產物。現階段只有一個開發映像，無須新增 Compose。只帶回 tar 映像並不等於帶回完整 Workspace：volume、bind mount、未提交的變更都需另行備份。
 
-## 4. 建議資料夾結構（規劃）
+## 4. 現行資料夾結構
 
 ```text
-aicar_ws/
-├── src/                 # 實際 ROS2 package（取得後放入）
+ros2-differential-drive-robot/
+├── .github/workflows/ci.yml  # 自動化驗證
+├── src/ai_car/             # ROS2 package
 ├── docker/
-│   ├── Dockerfile       # 基礎環境與依賴
-│   └── compose.yaml     # 後續定義模擬服務
+│   └── Dockerfile       # 基礎環境與依賴
 ├── doc/
 │   ├── 09-aicar-ros2-code-review.md
 │   └── 10-aicar-docker-deployment.md
@@ -47,11 +47,11 @@ aicar_ws/
 
 `src/` 中放 Package 的原始碼。不同 CPU 的 `build/`、`install/`、`log/` 不應直接共用或提交至 Git。實車與模擬的 Launch/parameters 應分離。
 
-## 5. 第一階段：最小 ROS2 學習環境
+## 5. 最小 ROS2 開發環境
 
-以下是**尚未替 AICAR 建置驗收的示範配方**，需在學校或 Mac 的 Linux 容器環境實際測試。暫不安裝大型圖形套件，先驗證 ROS2 與跨平台基礎。
+以下為現行 `docker/Dockerfile`，已由 AMD64 GitHub Runner 建置與驗證。ARM64 與 Mac 仍需獨立確認；大型圖形套件與實車依賴不在此精簡映像的責任範圍。
 
-在未來的 `docker/Dockerfile` 內：
+現行配方：
 
 ```dockerfile
 FROM ros:jazzy-ros-base
@@ -60,9 +60,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-jazzy-demo-nodes-cpp \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
+CMD ["bash"]
 ```
 
-註：官方 ROS Image 已提供啟動用環境。互動 shell 可用 `source /opt/ros/jazzy/setup.bash` 明確載入 ROS2。實際 AICAR 依賴須從 `package.xml` 與正式原始碼確認；目前不能聲稱這個 Image 足以建置 AICAR。
+註：官方 ROS Image 已提供啟動用環境。互動 shell 可用 `source /opt/ros/jazzy/setup.bash` 明確載入 ROS2。`package.xml` 宣告 ROS2 與硬體依賴，但此 Dockerfile 未安裝 DYNAMIXEL SDK、`smbus` 等全部執行期依賴。建置成功及測試替身通過，不等於實車驅動可以正常啟動。
 
 在 Workspace 根目錄、已安裝 Docker 的主機執行：
 
@@ -97,19 +98,25 @@ docker image inspect --format '{{.Os}}/{{.Architecture}}' aicar-dev:jazzy-arm64
 
 ```bash
 docker run --rm -it --network none --name aicar-dev-shell \
-  --mount type=bind,source="$PWD/src",target=/workspace/src,readonly \
+  --mount type=bind,source="$PWD/src",target=/input,readonly \
   aicar-dev:jazzy-arm64 bash
 ```
 
-此示例只掛載原始碼為唯讀、不映射硬體設備、沒有外部網路連線。容器內的建置產物寫入 `/workspace` 的其他路徑，結束後將不保留。此環境適合先做隔離測試，不用於跨主機 Zenoh 或需要下載資源的工作。
+此示例與 CI 採同樣的隔離概念：只掛載原始碼為唯讀、不映射硬體設備、沒有外部網路連線。先將資料複製至容器自己的工作區，建置產物結束後不保留。此環境不適合跨主機 Zenoh 或需要下載資源的工作。Mac 上尚未驗證下列流程。
 
 ```bash
+cp -a /input /workspace/src
 source /opt/ros/jazzy/setup.bash
-echo "$ROS_DISTRO"
-ros2 pkg list
+colcon build --packages-select ai_car
+source install/setup.bash
+ros2 pkg prefix ai_car
+python3 src/ai_car/test/ros_base_smoke.py
+python3 src/ai_car/test/ros_imu_smoke.py
+python3 src/ai_car/test/ros_odom_smoke.py
+python3 src/ai_car/test/ros_teleop_smoke.py
 ```
 
-可使用 ROS2 官方 demo 在容器內做單機通訊驗收；AICAR 完整依賴取得後再加入建置與測試。不要啟動實體馬達驅動。容器中未來若要下載相依套件，應於 Image 建置階段完成，不要依賴每次臨時安裝。
+上述四支 smoke test 使用真實 ROS2 訊息介面及硬體測試替身，並非四個驅動的實車啟動。79 項離線測試及證據見 [06](06-smoke-tests.md)。不要啟動實體馬達驅動。新增相依套件應於 Image 建置階段完成，而非每次臨時安裝。
 
 ## 8. 第二階段：Gazebo、RViz2 與 GUI
 
@@ -145,7 +152,7 @@ gz sim -s shapes.sdf
 
 ## 9. 模擬／實車隔離規則
 
-- 家中開發 Image 不應配置 U2D2、GPIO、實車馬達或學校設備的連線；維持 `hardware_enabled=False`。
+- 家中開發 Image 不配置 U2D2、GPIO 或實車馬達連線。正式 Base 沒有 `hardware_enabled` 停用參數；隔離依靠不掛載硬體、不連接實車網路、不啟動正式硬體入口，以及使用測試替身。
 - 模擬工作先使用獨立的容器網路與 ROS Domain；與實車網路隔離，避免同名控制 Topic 混用。
 - 不將 SSH key、Token、Wi-Fi 密碼或實車私有配置烘焙入 Image。
 - 跨主機 Zenoh 在獨立測試網路中驗收，記錄 RMW、Router、QoS、時間同步；不把一般開發環境的網路設定直接沿用到實車。
@@ -155,16 +162,18 @@ gz sim -s shapes.sdf
 
 | 項目 | 通過標準 | 狀態 |
 | --- | --- | --- |
-| 建置 AMD64 Image | 學校可載入、啟動 | 待驗證 |
+| 建置 AMD64 Image | GitHub Runner 建置與執行 | PASS（CI；學校另行重現） |
 | 建置 ARM64 Image | Mac 可載入、啟動 | 待驗證 |
 | Image 匯出／匯入 | 版本、架構、標籤正確 | 待驗證 |
-| ROS2 CLI | ROS_DISTRO、Package 清單正常 | 待驗證 |
-| ROS2 Node 測試 | 不使用真實設備，測試可重複 | 待驗證 |
-| AICAR Build | 取得完整原碼後可重建 | 未取得原碼 |
+| ROS2 CLI | `ros2 pkg prefix ai_car` 發現套件 | PASS（CI） |
+| ROS2 Node 測試 | 四個 ROS2 假硬體 smoke test | PASS（CI） |
+| AICAR Build | `colcon build --packages-select ai_car` | PASS（CI） |
+| 離線單元測試 | 語法／XML 與 79 項測試 | PASS（CI） |
 | Gazebo headless | Server、模擬時間，實驗資料可輸出 | 待驗證 |
 | RViz2 GUI | 顯示正確的 URDF/TF | 待驗證 |
 | Bridge | 型別、方向、時間正確 | 待驗證 |
-| 安全隔離 | 模擬不與實車控制通訊 | 待驗證 |
+| CI 隔離 | 容器無外部網路及裝置掛載 | PASS（CI 配置與執行；物理安全待驗證） |
+| 實車執行期依賴 | 真實 SDK、I²C 與裝置支援 | 待驗證 |
 
 ## 11. 參考資料
 
