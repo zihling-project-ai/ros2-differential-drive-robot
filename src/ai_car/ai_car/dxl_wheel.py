@@ -15,6 +15,8 @@ LEFT_ID = 1
 RIGHT_ID = 2
 REAR_LEFT_ID = 3
 REAR_RIGHT_ID = 4
+WHEEL_IDS = (LEFT_ID, RIGHT_ID, REAR_LEFT_ID, REAR_RIGHT_ID)
+VELOCITY_CONTROL_MODE = 1
 
 XM_TICK2RAD = 0.001533981
 
@@ -30,22 +32,41 @@ class Wheel_Controller():
         self.port = port
         self.packet = PacketHandler(1.0)
 
+        self._verify_velocity_mode()
+        # Request a stationary target, but never enable torque during construction.
         self.reset()
 
+    def _check_result(self, motor_id, operation, result, error):
+        if result != COMM_SUCCESS or error != 0:
+            raise RuntimeError(
+                f'Motor {motor_id}: {operation} failed '
+                f'(communication={result}, device_error={error})'
+            )
+
+    def _verify_velocity_mode(self):
+        # The calibrated hardware configuration is not changed by this driver.
+        for motor_id in WHEEL_IDS:
+            mode, result, error = self.packet.read1ByteTxRx(
+                self.port, motor_id, XM_OPERATING_MODE_ADDRESS
+            )
+            self._check_result(motor_id, 'read operating mode', result, error)
+            if mode != VELOCITY_CONTROL_MODE:
+                raise RuntimeError(f'Motor {motor_id}: expected velocity control mode, got {mode}')
+
     def reset(self):
-        self.set_torque(0)
-
-        self.packet.write1ByteTxRx(self.port, LEFT_ID, XM_OPERATING_MODE_ADDRESS, int(3))
-        self.packet.write1ByteTxRx(self.port, RIGHT_ID, XM_OPERATING_MODE_ADDRESS, int(3))
-        self.packet.write1ByteTxRx(self.port, REAR_LEFT_ID, XM_OPERATING_MODE_ADDRESS, int(3))
-        self.packet.write1ByteTxRx(self.port, REAR_RIGHT_ID, XM_OPERATING_MODE_ADDRESS, int(3))
-
-        self.packet.write1ByteTxRx(self.port, LEFT_ID, XM_OPERATING_MODE_ADDRESS, int(1))
-        self.packet.write1ByteTxRx(self.port, RIGHT_ID, XM_OPERATING_MODE_ADDRESS, int(1))
-        self.packet.write1ByteTxRx(self.port, REAR_LEFT_ID, XM_OPERATING_MODE_ADDRESS, int(1))
-        self.packet.write1ByteTxRx(self.port, REAR_RIGHT_ID, XM_OPERATING_MODE_ADDRESS, int(1))
-
-        self.set_torque(1)
+        """Request a stop; encoder baselines are managed by AICAR Base."""
+        errors = []
+        for motor_id in WHEEL_IDS:
+            try:
+                result, error = self.packet.write4ByteTxRx(
+                    self.port, motor_id, XM_GOAL_VELOCITY_ADDRESS, 0
+                )
+                self._check_result(motor_id, 'request stop', result, error)
+            except Exception as exc:
+                # Attempt to stop every wheel, even if one command fails.
+                errors.append(f'Motor {motor_id}: {exc}')
+        if errors:
+            raise RuntimeError('; '.join(errors))
 
     def set_torque(self, set_data):
         set_data = to_uint32(set_data)

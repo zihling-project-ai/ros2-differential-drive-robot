@@ -37,7 +37,7 @@ jobs:
           print(f'Parsed {len(sources)} Python files, package.xml, and URDF XML')
           PY
 
-      - name: Run offline arm driver unit tests
+      - name: Run offline driver unit tests
         run: PYTHONPATH=src/ai_car python3 -m unittest discover -s src/ai_car/test -p 'test_*.py' -v
 
   ros2-build:
