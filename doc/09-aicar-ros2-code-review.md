@@ -6,6 +6,35 @@
 
 ## 0. Repository 目錄與同名程式比較
 
+### 目錄責任圖
+
+```text
+ros2-differential-drive-robot/    # 工程專案／ROS2 workspace
+├── .github/workflows/           # 自動建置與驗證（CI）
+├── .vscode/                     # 編輯器開發設定
+├── docker/                      # 可重現的 Jazzy 執行環境
+├── doc/                         # 設計決策、實驗與驗收證據
+├── src/
+│   └── ai_car/                  # ROS2 package
+│       ├── ai_car/              # 正式 Python 模組：控制、驅動、感知、里程計
+│       ├── config/              # SLAM / Nav2 參數
+│       ├── launch/              # ROS2 nodes 的啟動與協調
+│       ├── urdf/                # 機器人結構、關節與物理模型
+│       ├── meshes/              # URDF 引用的 3D 幾何模型
+│       ├── rviz/                # 可視化配置
+│       ├── resource/            # Ament 套件索引標記
+│       ├── share/               # 教師參考解答（暫保留，不作正式執行入口）
+│       ├── package.xml          # 套件身分、建置類型與依賴
+│       ├── setup.py / setup.cfg # 安裝規則、執行入口與位置
+│       └── 99-aicar.rules       # Linux 裝置識別與存取規則
+├── .gitignore / .dockerignore   # 排除建置產物與無關檔案
+└── README.md                    # 專案入口、狀態與文件索引
+```
+
+**設計判斷：** 區分工程環境、機器人實作、部署配置與驗證紀錄。正式程式只從內層 `ai_car/` 演進；教師參考解答應逐項比較優缺點，確認功能與安全性後再統一為一套實作，避免長期維護兩套程式。
+
+### 正式程式與參考解答
+
 `src/ai_car/setup.py` 的 `console_scripts` 指向 `ai_car.aicar_base`、`aicar_imu`、`aicar_odom`、`aicar_teleop`；`find_packages()` 安裝 Python package。`data_files` 中的 `share/ai_car` 是安裝後資源目錄，不是來源中的 `src/ai_car/share/`。目前追蹤檔內未發現使用來源 `share/` 的引用。
 
 | 同名 Python 檔 | `share/` / `ai_car/` 行數 | 比較 |
